@@ -5,11 +5,14 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import os
+from datetime import datetime
+
 import serial
 from serial.tools import list_ports
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QAction
+from PyQt5.QtWidgets import QAction
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -113,6 +116,19 @@ class TimeMachineClient:
 
         self._write_slow(cmd)
 
+    # def read_available_bytes(self, duration: float = 3.0) -> bytes:
+    #     deadline = time.time() + duration
+    #     out = bytearray()
+
+    #     while time.time() < deadline:
+    #         waiting = self.ser.in_waiting
+    #         if waiting:
+    #             out.extend(self.ser.read(waiting))
+    #         else:
+    #             time.sleep(0.01)
+
+    #     return bytes(out)
+
     def read_available_bytes(self, duration: float = 3.0) -> bytes:
         deadline = time.time() + duration
         out = bytearray()
@@ -126,6 +142,27 @@ class TimeMachineClient:
 
         return bytes(out)
 
+
+    def read_until_end_of_retransmit(self, timeout_seconds: float = 5.0) -> bytes:
+        deadline = time.time() + timeout_seconds
+        out = bytearray()
+
+        while time.time() < deadline:
+            waiting = self.ser.in_waiting
+            if waiting:
+                chunk = self.ser.read(waiting)
+                if chunk:
+                    out.extend(chunk)
+
+                    cleaned_text = sanitize_device_bytes(bytes(out))
+                    if "END OF RETRANSMIT" in cleaned_text.upper():
+                        break
+            else:
+                time.sleep(0.01)
+
+        return bytes(out)
+
+
     def download_memory_bytes(
         self,
         event_num: int = 0,
@@ -134,7 +171,7 @@ class TimeMachineClient:
         read_seconds: float = 5.0,
     ) -> bytes:
         self.retransmit(event_num=event_num, heat_num=heat_num, start_time=start_time)
-        return self.read_available_bytes(duration=read_seconds)
+        return self.read_until_end_of_retransmit(timeout_seconds=read_seconds)
 
 
 # -----------------------------
@@ -145,6 +182,7 @@ class ParsedRow:
     row_type: str
     event: str
     heat: str
+    date: str
     lane: str
     lap: str
     cumulative_time: str
@@ -162,7 +200,25 @@ CONTROL_DROP = {
     0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
     0x7F,
 }
+def get_local_date_string() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
 
+def format_bytes_mixed_ascii_hex(raw: bytes) -> str:
+    out = []
+
+    for b in raw:
+        if b == 0x0D:
+            out.append("\r")
+        elif b == 0x0A:
+            out.append("\n")
+        elif b == 0x09:
+            out.append("\t")
+        elif 0x20 <= b <= 0x7E:
+            out.append(chr(b))
+        else:
+            out.append(f"[0x{b:02X}]")
+
+    return "".join(out)
 
 def sanitize_device_bytes(raw: bytes) -> str:
     """
@@ -200,23 +256,25 @@ def clean_lines_for_parsing(text: str) -> List[str]:
 HEADER_EVENT_RE = re.compile(r"^EVENT\s+(\d{3})$", re.IGNORECASE)
 HEADER_HEAT_RE = re.compile(r"^HEAT\s*(\d{2})$|^HEAT\s+(\d{2})$", re.IGNORECASE)
 HEADER_HEAT_ONLY_RE = re.compile(r"^(\d{2})$")
+HEADER_HEAT_T_RE = re.compile(r"^T\s*(\d{2})$", re.IGNORECASE)
 HEADER_LT_RE = re.compile(r"^LT\s+(\d{2}:\d{2}:\d{2}\.\d{2})$", re.IGNORECASE)
 HEADER_DATE_RE = re.compile(r"^DATE\s+(.+)$", re.IGNORECASE)
 
-# Example:
-# 02   01 00:00:05.14  00:05.14
 RESULT_RE = re.compile(
     r"^([0-9A-Z]{1,3})\s+(\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{2})\s+(\d{2}:\d{2}\.\d{2})$",
     re.IGNORECASE
 )
 
-
 def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
     lines = clean_lines_for_parsing(text)
     rows: List[ParsedRow] = []
 
+    fallback_date = get_local_date_string()
+
     current_event = ""
     current_heat = ""
+    current_event_index = -1
+
     meta = {
         "event": "",
         "heat": "",
@@ -224,49 +282,101 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
         "date": "",
     }
 
+    event_dates = {}
     saw_live_time = False
 
-    for line in lines:
+    for i, line in enumerate(lines):
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+
         m = HEADER_LT_RE.match(line)
         if m:
             saw_live_time = True
             meta["lt"] = m.group(1)
-            rows.append(ParsedRow("live_time", current_event, current_heat, "", "", m.group(1), "", line))
+            rows.append(ParsedRow("live_time", current_event, current_heat, "", "", "", m.group(1), "", line))
             continue
 
         m = HEADER_DATE_RE.match(line)
         if m:
-            meta["date"] = m.group(1)
-            rows.append(ParsedRow("date", current_event, current_heat, "", "", "", "", line))
+            parsed_date = m.group(1).strip()
+            meta["date"] = parsed_date
+
+            if current_event:
+                event_dates[current_event] = parsed_date
+
+            rows.append(ParsedRow("date", current_event, current_heat, parsed_date, "", "", "", "", line))
             continue
 
         m = HEADER_EVENT_RE.match(line)
         if m:
             current_event = m.group(1)
+            current_event_index = i
             meta["event"] = current_event
-            rows.append(ParsedRow("event_header", current_event, current_heat, "", "", "", "", line))
+            rows.append(ParsedRow("event_header", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
             continue
 
         m = HEADER_HEAT_RE.match(line)
         if m:
             current_heat = m.group(1) or m.group(2)
             meta["heat"] = current_heat
-            rows.append(ParsedRow("heat_header", current_event, current_heat, "", "", "", "", f"HEAT {current_heat}"))
+            rows.append(
+                ParsedRow(
+                    "heat_header",
+                    current_event,
+                    current_heat,
+                    event_dates.get(current_event, ""),
+                    "",
+                    "",
+                    "",
+                    "",
+                    f"HEAT {current_heat}",
+                )
+            )
+            continue
+
+        m = HEADER_HEAT_T_RE.match(line)
+        if m and RESULT_RE.match(next_line):
+            current_heat = m.group(1)
+            meta["heat"] = current_heat
+            rows.append(
+                ParsedRow(
+                    "heat_header",
+                    current_event,
+                    current_heat,
+                    event_dates.get(current_event, ""),
+                    "",
+                    "",
+                    "",
+                    "",
+                    f"HEAT {current_heat}",
+                )
+            )
             continue
 
         m = HEADER_HEAT_ONLY_RE.match(line)
-        if m and saw_live_time:
+        if m and saw_live_time and RESULT_RE.match(next_line):
             current_heat = m.group(1)
             meta["heat"] = current_heat
-            rows.append(ParsedRow("heat_header", current_event, current_heat, "", "", "", "", f"HEAT {current_heat}"))
+            rows.append(
+                ParsedRow(
+                    "heat_header",
+                    current_event,
+                    current_heat,
+                    event_dates.get(current_event, ""),
+                    "",
+                    "",
+                    "",
+                    "",
+                    f"HEAT {current_heat}",
+                )
+            )
             continue
 
         if line.upper().startswith("START OF RETRANSMIT"):
-            rows.append(ParsedRow("marker", current_event, current_heat, "", "", "", "", line))
+            rows.append(ParsedRow("marker", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
             continue
 
         if line.upper().startswith("END OF RETRANSMIT"):
-            rows.append(ParsedRow("marker", current_event, current_heat, "", "", "", "", line))
+            rows.append(ParsedRow("marker", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
             continue
 
         m = RESULT_RE.match(line)
@@ -275,11 +385,13 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
             lap = m.group(2)
             cumulative = m.group(3)
             split = m.group(4)
+
             rows.append(
                 ParsedRow(
                     "result",
                     current_event,
                     current_heat,
+                    event_dates.get(current_event, ""),
                     lane,
                     lap,
                     cumulative,
@@ -289,10 +401,9 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
             )
             continue
 
-        rows.append(ParsedRow("raw", current_event, current_heat, "", "", "", "", line))
+        rows.append(ParsedRow("raw", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
 
     return rows, meta
-
 
 # -----------------------------
 # Worker threads
@@ -398,8 +509,83 @@ class MainWindow(QMainWindow):
         self.download_worker: Optional[DownloadWorker] = None
         self.live_worker: Optional[LiveCaptureWorker] = None
 
+        self.log_file_path = self.create_session_log_file()
+        self.live_capture_log_path = self.create_live_capture_log_file()
+
         self._build_ui()
         self.refresh_ports()
+
+
+    def create_live_capture_log_file(self) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.abspath(f"time_machine_live_capture_log_{timestamp}.txt")
+
+
+    def append_live_capture_start_log(self):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        port = self.selected_port()
+        baud = self.selected_baud()
+
+        header = (
+            f"\n===== LIVE CAPTURE STARTED | {timestamp} | port={port} | baud={baud} =====\n"
+        ).encode("ascii", errors="ignore")
+
+        self.append_to_live_capture_log(header)
+
+    def append_live_capture_stop_log(self):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        port = self.selected_port()
+        baud = self.selected_baud()
+
+        with open(self.live_capture_log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n===== LIVE CAPTURE STOPPED | {timestamp} | port={port} | baud={baud} =====\n")
+
+    def create_session_log_file(self) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.abspath(f"time_machine_raw_log_{timestamp}.txt")
+
+    def append_to_live_capture_log(self, data: bytes):
+        if not data:
+            return
+
+        formatted = format_bytes_mixed_ascii_hex(data)
+
+        with open(self.live_capture_log_path, "a", encoding="utf-8") as f:
+            f.write(formatted)
+
+    def append_to_raw_log(self, raw: bytes):
+        if not raw:
+            return
+
+        formatted = format_bytes_mixed_ascii_hex(raw)
+
+        with open(self.log_file_path, "a", encoding="utf-8") as f:
+            f.write(formatted)
+
+    def build_csv_default_name(self) -> str:
+        visible_rows = [
+            row for row in self.last_rows
+            if row.row_type not in {"live_time", "heat_header", "event_header", "raw"}
+        ]
+
+        events = sorted({row.event for row in visible_rows if row.event.isdigit()})
+        heats = sorted({row.heat for row in visible_rows if row.heat.isdigit()})
+
+        if not events:
+            event_part = "event_unknown"
+        elif len(events) == 1:
+            event_part = f"event{int(events[0]):03d}"
+        else:
+            event_part = f"event{int(events[0]):03d}-{int(events[-1]):03d}"
+
+        if not heats:
+            heat_part = "heat_unknown"
+        elif len(heats) == 1:
+            heat_part = f"heat{int(heats[0]):02d}"
+        else:
+            heat_part = f"heat{int(heats[0]):02d}-{int(heats[-1]):02d}"
+
+        return f"{event_part}_{heat_part}_results.csv"
 
     def _build_ui(self):
         self._build_toolbar()
@@ -497,10 +683,19 @@ class MainWindow(QMainWindow):
         table_group = QGroupBox("Parsed Results")
         table_layout = QVBoxLayout(table_group)
 
-        self.table = QTableWidget(0, 8)
+        #self.table = QTableWidget(0, 8)
+        #self.table.setHorizontalHeaderLabels(
+        #    ["Type", "Event", "Heat", "Lane", "Lap", "Cumulative", "Lap Time", "Raw Line"]
+        #)
+        #self.table = QTableWidget(0, 6)
+        #self.table.setHorizontalHeaderLabels(
+        #    ["Event", "Heat", "Lane", "Lap", "Cumulative", "Lap Time"]
+        #)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Type", "Event", "Heat", "Lane", "Lap", "Cumulative", "Lap Time", "Raw Line"]
-        )
+            ["Event", "Heat", "Date", "Lane", "Lap", "Cumulative", "Lap Time"]
+            )
+
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSortingEnabled(True)
@@ -556,17 +751,33 @@ class MainWindow(QMainWindow):
         self.port_combo.clear()
 
         ports = list(list_ports.comports())
+
+        def port_sort_key(p):
+            m = re.match(r"COM(\d+)$", p.device, re.IGNORECASE)
+            if m:
+                return (0, int(m.group(1)))
+            return (1, p.device.upper())
+
+        ports.sort(key=port_sort_key)
+
         for p in ports:
             self.port_combo.addItem(f"{p.device} — {p.description}", p.device)
 
         if not ports:
             self.port_combo.addItem("No ports found", "")
-
-        if current:
-            for i in range(self.port_combo.count()):
-                if self.port_combo.itemData(i) == current:
-                    self.port_combo.setCurrentIndex(i)
-                    break
+        else:
+            # Keep current selection if it still exists
+            if current:
+                for i in range(self.port_combo.count()):
+                    if self.port_combo.itemData(i) == current:
+                        self.port_combo.setCurrentIndex(i)
+                        break
+                else:
+                    # Otherwise default to lowest COM port
+                    self.port_combo.setCurrentIndex(0)
+            else:
+                # First load: default to lowest COM port
+                self.port_combo.setCurrentIndex(0)
 
         self.status.showMessage("COM ports refreshed")
 
@@ -610,6 +821,8 @@ class MainWindow(QMainWindow):
         self.last_raw_bytes = raw
         self.last_rows = rows
 
+        self.append_to_raw_log(raw)
+
         self.populate_table(rows)
         self.update_raw_view()
 
@@ -617,6 +830,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage(
             f"Download complete: event {meta.get('event', '')}, heat {meta.get('heat', '')}, {len(raw)} bytes"
         )
+
 
     def on_download_failed(self, msg: str):
         self.download_btn.setEnabled(True)
@@ -638,6 +852,8 @@ class MainWindow(QMainWindow):
         self.populate_table([])
         self.update_raw_view()
 
+        self.append_live_capture_start_log()
+
         self.live_worker = LiveCaptureWorker(port=port, baud=self.selected_baud())
         self.live_worker.chunk_received.connect(self.on_live_chunk)
         self.live_worker.failed.connect(self.on_live_failed)
@@ -652,6 +868,8 @@ class MainWindow(QMainWindow):
         if self.live_worker is not None:
             self.live_worker.stop()
             self.live_worker.wait(1000)
+
+        self.append_live_capture_stop_log()
 
         self.live_start_btn.setEnabled(True)
         self.live_stop_btn.setEnabled(False)
@@ -668,6 +886,8 @@ class MainWindow(QMainWindow):
         self.live_raw_buffer.extend(data)
         self.last_raw_bytes = bytes(self.live_raw_buffer)
 
+        self.append_to_live_capture_log(data)
+
         cleaned = sanitize_device_bytes(self.last_raw_bytes)
         rows, _ = parse_time_machine_text(cleaned)
         self.last_rows = rows
@@ -676,6 +896,7 @@ class MainWindow(QMainWindow):
         self.update_raw_view()
 
     def on_live_failed(self, msg: str):
+        self.append_live_capture_stop_log()
         self.live_start_btn.setEnabled(True)
         self.live_stop_btn.setEnabled(False)
         self.download_btn.setEnabled(True)
@@ -686,24 +907,28 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
 
+        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+
         for row in rows:
+            if row.row_type in hidden_types:
+                continue
+
             r = self.table.rowCount()
             self.table.insertRow(r)
 
             values = [
-                row.row_type,
                 row.event,
                 row.heat,
+                row.date,
                 row.lane,
                 row.lap,
                 row.cumulative_time,
                 row.split_time,
-                row.raw_line,
             ]
 
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if c in (1, 2, 4):
+                if c in (0, 1, 4):
                     item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(r, c, item)
 
@@ -738,27 +963,32 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Table CSV",
-            "time_machine_results.csv",
+            self.build_csv_default_name(),
             "CSV Files (*.csv)",
         )
         if not path:
             return
 
+        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Type", "Event", "Heat", "Lane", "Lap", "Cumulative", "Lap Time", "Raw Line"])
+                writer.writerow(["Type", "Event", "Heat", "Date", "Lane", "Lap", "Cumulative", "Lap Time", "Raw Line"])
                 for row in self.last_rows:
+                    if row.row_type in hidden_types:
+                        continue
                     writer.writerow([
                         row.row_type,
                         row.event,
                         row.heat,
+                        row.date,
                         row.lane,
                         row.lap,
                         row.cumulative_time,
                         row.split_time,
                         row.raw_line,
-                    ])
+])
             self.status.showMessage(f"Saved CSV: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
