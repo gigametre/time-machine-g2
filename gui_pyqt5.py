@@ -11,6 +11,13 @@ from datetime import datetime
 import serial
 from serial.tools import list_ports
 
+#TODO: consider using qasync and asyncio for better async handling and cancellation support
+#TODO: consider adding a "live parsing" mode that incrementally parses and updates the table as data comes in during live capture, rather than waiting until the end
+#TODO: Add a better GUI to graphically show athletes finishing.
+#TODO: Add ability to correlate Event # to actual event names by allowing user to load a CSV with event/heat metadata, and then showing that metadata in the table and using it for default CSV export names.
+#TODO: Add ability to correlate lane numbers to athlete names by allowing user to load a CSV with event/heat/lane/athlete metadata, and then showing athlete names in the table and using them for CSV export.
+
+
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import QAction
 from PyQt5.QtWidgets import (
@@ -269,11 +276,8 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
     lines = clean_lines_for_parsing(text)
     rows: List[ParsedRow] = []
 
-    fallback_date = get_local_date_string()
-
     current_event = ""
     current_heat = ""
-    current_event_index = -1
 
     meta = {
         "event": "",
@@ -284,6 +288,7 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
 
     event_dates = {}
     saw_live_time = False
+    fallback_date = get_local_date_string()
 
     for i, line in enumerate(lines):
         next_line = lines[i + 1] if i + 1 < len(lines) else ""
@@ -292,7 +297,19 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
         if m:
             saw_live_time = True
             meta["lt"] = m.group(1)
-            rows.append(ParsedRow("live_time", current_event, current_heat, "", "", "", m.group(1), "", line))
+            rows.append(
+                ParsedRow(
+                    "live_time",
+                    current_event,
+                    current_heat,
+                    "",
+                    "",
+                    "",
+                    m.group(1),
+                    "",
+                    line,
+                )
+            )
             continue
 
         m = HEADER_DATE_RE.match(line)
@@ -303,27 +320,56 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
             if current_event:
                 event_dates[current_event] = parsed_date
 
-            rows.append(ParsedRow("date", current_event, current_heat, parsed_date, "", "", "", "", line))
+            rows.append(
+                ParsedRow(
+                    "date",
+                    current_event,
+                    current_heat,
+                    parsed_date,
+                    "",
+                    "",
+                    "",
+                    "",
+                    line,
+                )
+            )
             continue
 
         m = HEADER_EVENT_RE.match(line)
         if m:
             current_event = m.group(1)
-            current_event_index = i
             meta["event"] = current_event
-            rows.append(ParsedRow("event_header", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
+
+            rows.append(
+                ParsedRow(
+                    "event_header",
+                    current_event,
+                    current_heat,
+                    event_dates.get(current_event, ""),
+                    "",
+                    "",
+                    "",
+                    "",
+                    line,
+                )
+            )
             continue
 
         m = HEADER_HEAT_RE.match(line)
         if m:
             current_heat = m.group(1) or m.group(2)
             meta["heat"] = current_heat
+
+            row_date = event_dates.get(current_event, "")
+            if not row_date and saw_live_time:
+                row_date = fallback_date
+
             rows.append(
                 ParsedRow(
                     "heat_header",
                     current_event,
                     current_heat,
-                    event_dates.get(current_event, ""),
+                    row_date,
                     "",
                     "",
                     "",
@@ -337,12 +383,17 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
         if m and RESULT_RE.match(next_line):
             current_heat = m.group(1)
             meta["heat"] = current_heat
+
+            row_date = event_dates.get(current_event, "")
+            if not row_date and saw_live_time:
+                row_date = fallback_date
+
             rows.append(
                 ParsedRow(
                     "heat_header",
                     current_event,
                     current_heat,
-                    event_dates.get(current_event, ""),
+                    row_date,
                     "",
                     "",
                     "",
@@ -356,12 +407,17 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
         if m and saw_live_time and RESULT_RE.match(next_line):
             current_heat = m.group(1)
             meta["heat"] = current_heat
+
+            row_date = event_dates.get(current_event, "")
+            if not row_date and saw_live_time:
+                row_date = fallback_date
+
             rows.append(
                 ParsedRow(
                     "heat_header",
                     current_event,
                     current_heat,
-                    event_dates.get(current_event, ""),
+                    row_date,
                     "",
                     "",
                     "",
@@ -372,11 +428,43 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
             continue
 
         if line.upper().startswith("START OF RETRANSMIT"):
-            rows.append(ParsedRow("marker", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
+            row_date = event_dates.get(current_event, "")
+            if not row_date and saw_live_time:
+                row_date = fallback_date
+
+            rows.append(
+                ParsedRow(
+                    "marker",
+                    current_event,
+                    current_heat,
+                    row_date,
+                    "",
+                    "",
+                    "",
+                    "",
+                    line,
+                )
+            )
             continue
 
         if line.upper().startswith("END OF RETRANSMIT"):
-            rows.append(ParsedRow("marker", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
+            row_date = event_dates.get(current_event, "")
+            if not row_date and saw_live_time:
+                row_date = fallback_date
+
+            rows.append(
+                ParsedRow(
+                    "marker",
+                    current_event,
+                    current_heat,
+                    row_date,
+                    "",
+                    "",
+                    "",
+                    "",
+                    line,
+                )
+            )
             continue
 
         m = RESULT_RE.match(line)
@@ -386,12 +474,16 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
             cumulative = m.group(3)
             split = m.group(4)
 
+            row_date = event_dates.get(current_event, "")
+            if not row_date and saw_live_time:
+                row_date = fallback_date
+
             rows.append(
                 ParsedRow(
                     "result",
                     current_event,
                     current_heat,
-                    event_dates.get(current_event, ""),
+                    row_date,
                     lane,
                     lap,
                     cumulative,
@@ -401,7 +493,23 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
             )
             continue
 
-        rows.append(ParsedRow("raw", current_event, current_heat, event_dates.get(current_event, ""), "", "", "", "", line))
+        row_date = event_dates.get(current_event, "")
+        if not row_date and saw_live_time:
+            row_date = fallback_date
+
+        rows.append(
+            ParsedRow(
+                "raw",
+                current_event,
+                current_heat,
+                row_date,
+                "",
+                "",
+                "",
+                "",
+                line,
+            )
+        )
 
     return rows, meta
 
@@ -500,7 +608,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Time Machine Downloader")
-        self.resize(1250, 800)
+        self.resize(1850, 1000)
 
         self.last_raw_bytes = b""
         self.last_rows: List[ParsedRow] = []
@@ -509,13 +617,35 @@ class MainWindow(QMainWindow):
         self.download_worker: Optional[DownloadWorker] = None
         self.live_worker: Optional[LiveCaptureWorker] = None
 
+        self.log_session_dir = self.create_log_session_dir()
         self.log_file_path = self.create_session_log_file()
         self.live_capture_log_path = self.create_live_capture_log_file()
 
         self._build_ui()
         self.refresh_ports()
 
+    def create_log_session_dir(self) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = os.path.abspath("logs")
+        session_dir = os.path.join(base_dir, f"session_{timestamp}")
+        os.makedirs(session_dir, exist_ok=True)
+        return session_dir
 
+
+    def create_session_log_file(self) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(
+            self.log_session_dir,
+            f"time_machine_raw_log_{timestamp}.txt"
+        )
+
+
+    def create_live_capture_log_file(self) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(
+            self.log_session_dir,
+            f"time_machine_live_capture_log_{timestamp}.txt"
+        )
     def create_live_capture_log_file(self) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return os.path.abspath(f"time_machine_live_capture_log_{timestamp}.txt")
@@ -693,11 +823,12 @@ class MainWindow(QMainWindow):
         #)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Event", "Heat", "Date", "Lane", "Lap", "Cumulative", "Lap Time"]
+            ["Date", "Event", "Heat", "Lane", "Lap", "Cumulative", "Lap Time"]
             )
 
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        #self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        #self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSortingEnabled(True)
         table_layout.addWidget(self.table)
 
@@ -710,13 +841,13 @@ class MainWindow(QMainWindow):
 
         right_split.addWidget(table_group)
         right_split.addWidget(raw_out_group)
-        right_split.setSizes([450, 280])
+        right_split.setSizes([650, 220])
 
         right_layout.addWidget(right_split)
 
         split.addWidget(left)
         split.addWidget(right)
-        split.setSizes([320, 900])
+        split.setSizes([300, 1400])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -917,9 +1048,9 @@ class MainWindow(QMainWindow):
             self.table.insertRow(r)
 
             values = [
+                row.date,
                 row.event,
                 row.heat,
-                row.date,
                 row.lane,
                 row.lap,
                 row.cumulative_time,
