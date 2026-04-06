@@ -486,6 +486,22 @@ class TimeMachineClient:
 
         self._write_slow(cmd)
 
+    def set_event_heat(self, event_num: int, heat_num: int):
+        """
+        0x06 + ASCII 3-digit event + ASCII 2-digit heat + CR + LF
+        """
+        if not (1 <= event_num <= 999):
+            raise ValueError("event_num must be 1..999")
+        if not (1 <= heat_num <= 99):
+            raise ValueError("heat_num must be 1..99")
+
+        cmd = (
+            bytes([0x06]) +
+            f"{event_num:03d}{heat_num:02d}".encode("ascii") +
+            b"\r\n"
+        )
+        self._write_slow(cmd)
+
 
 # -----------------------------
 # GUI
@@ -598,11 +614,11 @@ class MainWindow(QMainWindow):
         dl_grid = QGridLayout(dl_group)
 
         self.event_spin = QSpinBox()
-        self.event_spin.setRange(0, 255)
+        self.event_spin.setRange(1, 999)
         self.event_spin.setValue(1)
 
         self.heat_spin = QSpinBox()
-        self.heat_spin.setRange(0, 99)
+        self.heat_spin.setRange(1, 99)
         self.heat_spin.setValue(1)
 
         self.read_seconds_spin = QDoubleSpinBox()
@@ -613,32 +629,38 @@ class MainWindow(QMainWindow):
 
         self.download_btn = QPushButton("Download Selected Event / Heat")
 
+        self.set_event_heat_btn = QPushButton("Set Event/Heat")
+
         dl_grid.addWidget(QLabel("Event"), 0, 0)
         dl_grid.addWidget(self.event_spin, 0, 1)
         dl_grid.addWidget(QLabel("Heat"), 1, 0)
         dl_grid.addWidget(self.heat_spin, 1, 1)
         dl_grid.addWidget(QLabel("Read Seconds"), 2, 0)
         dl_grid.addWidget(self.read_seconds_spin, 2, 1)
-        dl_grid.addWidget(self.download_btn, 3, 0, 1, 2)
+        dl_grid.addWidget(self.set_event_heat_btn, 3, 0, 1, 2)
+        dl_grid.addWidget(self.download_btn, 4, 0, 1, 2)
 
         bib_group = QGroupBox("Bib Lookup / Assignment")
         bib_grid = QGridLayout(bib_group)
 
         self.load_bib_csv_btn = QPushButton("Load Bib CSV")
         self.bib_csv_label = QLabel("No CSV loaded")
+        self.bib_allowed_label = QLabel("Allowed age groups: N/A")
         self.bib_lane_spin = QSpinBox()
         self.bib_lane_spin.setRange(1, 99)
-        self.bib_bib_spin = QLineEdit()
-        self.bib_bib_spin.setPlaceholderText("Bib #")
+        self.bib_bib_combo = QComboBox()
+        self.bib_bib_combo.setEnabled(False)
+        self.bib_bib_combo.addItem("Load bib CSV first", "")
         self.bib_assign_btn = QPushButton("Assign Bib to Lane")
 
         bib_grid.addWidget(self.load_bib_csv_btn, 0, 0, 1, 2)
         bib_grid.addWidget(self.bib_csv_label, 1, 0, 1, 2)
-        bib_grid.addWidget(QLabel("Lane"), 2, 0)
-        bib_grid.addWidget(self.bib_lane_spin, 2, 1)
-        bib_grid.addWidget(QLabel("Bib"), 3, 0)
-        bib_grid.addWidget(self.bib_bib_spin, 3, 1)
-        bib_grid.addWidget(self.bib_assign_btn, 4, 0, 1, 2)
+        bib_grid.addWidget(self.bib_allowed_label, 2, 0, 1, 2)
+        bib_grid.addWidget(QLabel("Lane"), 3, 0)
+        bib_grid.addWidget(self.bib_lane_spin, 3, 1)
+        bib_grid.addWidget(QLabel("Bib"), 4, 0)
+        bib_grid.addWidget(self.bib_bib_combo, 4, 1)
+        bib_grid.addWidget(self.bib_assign_btn, 5, 0, 1, 2)
 
         live_group = QGroupBox("Live Capture")
         live_grid = QGridLayout(live_group)
@@ -719,10 +741,18 @@ class MainWindow(QMainWindow):
 
         self.load_bib_csv_btn.clicked.connect(self.load_bib_csv)
         self.bib_assign_btn.clicked.connect(self.assign_bib_to_lane)
+        self.event_spin.valueChanged.connect(self.on_event_selection_changed)
 
+        self.set_event_heat_btn.clicked.connect(self.set_event_heat_selected)
         self.download_btn.clicked.connect(self.download_selected)
-        self.live_start_btn.clicked.connect(self.start_live_capture)
-        self.live_stop_btn.clicked.connect(self.stop_live_capture)
+        self.live_start_btn.clicked.connect(self.on_live_start_clicked)
+        self.live_stop_btn.clicked.connect(self.on_live_stop_clicked)
+
+    def on_live_start_clicked(self):
+        self.start_live_capture()
+
+    def on_live_stop_clicked(self):
+        self.stop_live_capture()
 
     def _build_toolbar(self):
         toolbar = QToolBar("Main")
@@ -781,6 +811,50 @@ class MainWindow(QMainWindow):
                 self.port_combo.setCurrentIndex(0)
 
         self.status.showMessage("COM ports refreshed")
+
+    def get_event_allowed_age_groups(self, event_num: int) -> List[str]:
+        if event_num < 1:
+            return []
+
+        age_group_cycle = ["9&10", "11&12", "13-15", "16-18"]
+        return [age_group_cycle[(event_num - 1) % len(age_group_cycle)]]
+
+    def bib_sort_key(self, bib: str):
+        if bib.isdigit():
+            return int(bib)
+        return bib
+
+    def update_bib_dropdown_options(self):
+        allowed_groups = self.get_event_allowed_age_groups(self.event_spin.value())
+
+        if not self.bib_lookup:
+            self.bib_bib_combo.clear()
+            self.bib_bib_combo.addItem("Load bib CSV first", "")
+            self.bib_bib_combo.setEnabled(False)
+            self.bib_allowed_label.setText("Allowed age groups: N/A")
+            return
+
+        allowed_bibs = [
+            bib for bib, info in self.bib_lookup.items()
+            if not allowed_groups or info.get("age_group") in allowed_groups
+        ]
+        allowed_bibs.sort(key=self.bib_sort_key)
+
+        self.bib_bib_combo.clear()
+        if allowed_bibs:
+            self.bib_bib_combo.addItem("Select bib", "")
+            for bib in allowed_bibs:
+                self.bib_bib_combo.addItem(bib, bib)
+            self.bib_bib_combo.setEnabled(True)
+        else:
+            self.bib_bib_combo.addItem("No bibs found for event age group", "")
+            self.bib_bib_combo.setEnabled(False)
+
+        age_display = ", ".join(allowed_groups) if allowed_groups else "All"
+        self.bib_allowed_label.setText(f"Allowed age groups: {age_display}")
+
+    def on_event_selection_changed(self, value: int):
+        self.update_bib_dropdown_options()
 
     # -----------------------------
     # Async serial helpers
@@ -882,6 +956,34 @@ class MainWindow(QMainWindow):
             if client is not None:
                 await asyncio.to_thread(client.close)
             self.download_btn.setEnabled(True)
+
+    @asyncSlot()
+    async def set_event_heat_selected(self):
+        port = self.selected_port()
+        if not port:
+            QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
+            return
+
+        if self.live_task and not self.live_task.done():
+            QMessageBox.warning(self, "Live Capture Active", "Stop live capture before setting event/heat.")
+            return
+
+        event_num = self.event_spin.value()
+        heat_num = self.heat_spin.value()
+
+        self.status.showMessage(f"Setting event {event_num}, heat {heat_num}...")
+
+        client = None
+        try:
+            client = await self._open_client(port, self.selected_baud(), 0.2)
+            await asyncio.to_thread(client.set_event_heat, event_num, heat_num)
+            self.status.showMessage(f"Set event {event_num}, heat {heat_num} command sent")
+        except Exception as e:
+            QMessageBox.critical(self, "Set Event/Heat Error", str(e))
+            self.status.showMessage("Failed to set event/heat")
+        finally:
+            if client is not None:
+                await asyncio.to_thread(client.close)
 
     @asyncSlot()
     async def start_live_capture(self):
@@ -1278,14 +1380,15 @@ class MainWindow(QMainWindow):
 
             self.bib_csv_label.setText(f"Bib CSV: {os.path.basename(path)}")
             self.status.showMessage(f"Loaded bib map with {len(self.bib_lookup)} entries")
+            self.update_bib_dropdown_options()
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
 
     def assign_bib_to_lane(self):
         lane_text = str(self.bib_lane_spin.value())
-        bib = self.bib_bib_spin.text().strip()
+        bib = self.bib_bib_combo.currentData()
         if not bib:
-            QMessageBox.warning(self, "Missing Bib", "Enter a bib number first.")
+            QMessageBox.warning(self, "Missing Bib", "Select a bib number first.")
             return
 
         event_code = f"{self.event_spin.value():03d}"
@@ -1323,16 +1426,14 @@ class MainWindow(QMainWindow):
         if column != 6:  # Bib column index
             return
 
-        bib_value = self.table.item(row, column).text().strip()
-        print(f"DEBUG: Bib column changed, value: '{bib_value}'")  # Debug
-        if not bib_value or bib_value == "N/A":
-            print("DEBUG: Bib value empty or N/A, returning")  # Debug
+        item = self.table.item(row, column)
+        if item is None:
             return
 
-        print(f"DEBUG: bib_lookup keys: {list(self.bib_lookup.keys())}")  # Debug
+        bib_value = item.text().strip()
+        if not bib_value or bib_value == "N/A":
+            return
 
-        # Find the corresponding ParsedRow by matching table data
-        # We need to find which ParsedRow corresponds to this table row
         hidden_types = {"live_time", "heat_header", "event_header", "raw"}
         table_row_index = 0
 
@@ -1341,35 +1442,35 @@ class MainWindow(QMainWindow):
                 continue
 
             if table_row_index == row:
-                # Found the matching ParsedRow
-                print(f"DEBUG: Found matching ParsedRow: {parsed_row.row_type}")  # Debug
                 if parsed_row.row_type != "result":
-                    print("DEBUG: Not a result row, returning")  # Debug
                     return
 
-                # Look up bib in CSV data
                 info = self.bib_lookup.get(bib_value, None)
-                print(f"DEBUG: Lookup result for bib '{bib_value}': {info}")  # Debug
+                if info is not None:
+                    allowed_groups = self.get_event_allowed_age_groups(int(parsed_row.event))
+                    if allowed_groups and info.get("age_group") not in allowed_groups:
+                        QMessageBox.warning(
+                            self,
+                            "Invalid Bib",
+                            f"Bib {bib_value} is not valid for event {parsed_row.event}. Allowed age group(s): {', '.join(allowed_groups)}."
+                        )
+                        return
+
                 if info is None:
-                    # Bib not found, set to N/A
                     parsed_row.bib = bib_value
                     parsed_row.team_name = "N/A"
                     parsed_row.first_name = "N/A"
                     parsed_row.last_name = "N/A"
                     parsed_row.gender = "N/A"
                     parsed_row.age_group = "N/A"
-                    print("DEBUG: Bib not found, set to N/A")  # Debug
                 else:
-                    # Update the ParsedRow with CSV data
                     parsed_row.bib = bib_value
                     parsed_row.team_name = info.get("team_name", "N/A")
                     parsed_row.first_name = info.get("first_name", "N/A")
                     parsed_row.last_name = info.get("last_name", "N/A")
                     parsed_row.gender = info.get("gender", "N/A")
                     parsed_row.age_group = info.get("age_group", "N/A")
-                    print(f"DEBUG: Updated ParsedRow with: {parsed_row.team_name}, {parsed_row.first_name}, {parsed_row.last_name}")  # Debug
 
-                # Update the table cells (disable signals temporarily to avoid recursion)
                 self.table.blockSignals(True)
                 self.table.setItem(row, 5, QTableWidgetItem(parsed_row.team_name))      # Team
                 self.table.setItem(row, 6, QTableWidgetItem(parsed_row.bib))            # Bib
@@ -1378,12 +1479,9 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, 9, QTableWidgetItem(parsed_row.gender))         # Gender
                 self.table.setItem(row, 10, QTableWidgetItem(parsed_row.age_group))     # Age Group
                 self.table.blockSignals(False)
-                print("DEBUG: Updated table cells")  # Debug
                 return
 
             table_row_index += 1
-
-        print(f"DEBUG: No matching ParsedRow found for table row {row}")  # Debug
 
     def save_raw_output(self):
         if not self.last_raw_bytes:

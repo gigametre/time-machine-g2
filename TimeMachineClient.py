@@ -63,10 +63,10 @@ class TimeMachineClient:
         """
         0x06 + ASCII 3-digit event + ASCII 2-digit heat + CR + LF
         """
-        if not (0 <= event_num <= 255):
-            raise ValueError("event_num must be 0..255")
-        if not (0 <= heat_num <= 99):
-            raise ValueError("heat_num must be 0..99")
+        if not (1 <= event_num <= 999):
+            raise ValueError("event_num must be 1..999")
+        if not (1 <= heat_num <= 99):
+            raise ValueError("heat_num must be 1..99")
 
         cmd = (
             bytes([0x06]) +
