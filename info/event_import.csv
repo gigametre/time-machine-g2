@@ -1,0 +1,37 @@
+event number,event name,age group,gender
+1,800m,9&10,Male
+2,800m,9&10,Female
+3,800m,11&12,Male
+4,800m,11&12,Female
+5,800m,13-15,Male
+6,800m,13-15,Female
+7,4x100 relay,9&10,Male
+8,4x100 relay,9&10,Female
+9,4x100 relay,11&12,Male
+10,4x100 relay,11&12,Female
+11,4x100 relay,13-15,Male
+12,4x100 relay,13-15,Female
+13,100m,9&10,Male
+14,100m,9&10,Female
+15,100m,11&12,Male
+16,100m,11&12,Female
+17,100m,13-15,Male
+18,100m,13-15,Female
+19,mile,9&10,Male
+20,mile,9&10,Female
+21,mile,11&12,Male
+22,mile,11&12,Female
+23,mile,13-15,Male
+24,mile,13-15,Female
+25,400m,9&10,Male
+26,400m,9&10,Female
+27,400m,11&12,Male
+28,400m,11&12,Female
+29,400m,13-15,Male
+30,400m,13-15,Female
+31,200m,9&10,Male
+32,200m,9&10,Female
+33,200m,11&12,Male
+34,200m,11&12,Female
+35,200m,13-15,Male
+36,200m,13-15,Female

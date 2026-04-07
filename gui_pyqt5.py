@@ -12,7 +12,8 @@ import serial
 from serial.tools import list_ports
 
 from qasync import QEventLoop, asyncSlot
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QGuiApplication, QStandardItemModel, QStandardItem
 
 
 #TODO: consider using qasync and asyncio for better async handling and cancellation support
@@ -22,6 +23,7 @@ from PyQt5.QtCore import Qt
 #TODO: Add ability to correlate lane numbers to athlete names by allowing user to load a CSV with event/heat/lane/athlete metadata, and then showing athlete names in the table and using them for CSV export.
 from PyQt5.QtWidgets import (
     QAction,
+    QActionGroup,
     QApplication,
     QMainWindow,
     QWidget,
@@ -33,6 +35,7 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QVBoxLayout,
+    QHBoxLayout,
     QGridLayout,
     QGroupBox,
     QTextEdit,
@@ -127,7 +130,7 @@ class ParsedRow:
     heat: str
     date: str
     lane: str
-    lap: str
+    place: str
     cumulative_time: str
     split_time: str
     raw_line: str
@@ -153,31 +156,8 @@ RESULT_RE = re.compile(
 
 
 def get_event_type(event_code: str) -> str:
-    """Convert event code to human-readable event type."""
-    try:
-        event_num = int(event_code)
-    except ValueError:
-        # Handle non-numeric event codes (like relay codes)
-        if not event_code.isdigit():
-            return "4x100 relay"
-        return event_code
-
-    # Define event type mapping by ranges
-    if 1 <= event_num <= 4:
-        return "800m"
-    elif 5 <= event_num <= 8:
-        return "4x100 relay"
-    elif 9 <= event_num <= 12:
-        return "100m"
-    elif 13 <= event_num <= 16:
-        return "1 mile"
-    elif 17 <= event_num <= 20:
-        return "400m"
-    elif 21 <= event_num <= 24:
-        return "200m"
-    else:
-        # Fallback for events outside the defined ranges
-        return f"Event {event_num}"
+    """Return the event code as-is; real name resolved later from event_name_map."""
+    return event_code.lstrip("0") or event_code
 
 
 def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
@@ -386,7 +366,7 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
         m = RESULT_RE.match(line)
         if m:
             lane = m.group(1)
-            lap = m.group(2)
+            place = m.group(2)
             cumulative = m.group(3)
             split = m.group(4)
 
@@ -402,7 +382,7 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
                     current_heat,
                     row_date,
                     lane,
-                    lap,
+                    place,
                     cumulative,
                     split,
                     line,
@@ -502,6 +482,156 @@ class TimeMachineClient:
         )
         self._write_slow(cmd)
 
+    def send_timer_command(self, command_id: int, payload: bytes = b""):
+        cmd = bytes([command_id]) + payload + b"\r\n"
+        self._write_slow(cmd)
+
+    def timer_start(self, start_hhmmss: str = "000000"):
+        # 0x82 + ASCII [1s sec, 10s sec, 1s min, 10s min, 1s hr, 10s hr] + CR/LF.
+        if len(start_hhmmss) != 6 or not start_hhmmss.isdigit():
+            raise ValueError("start_hhmmss must be 6 digits in HHMMSS format")
+        encoded = (
+            f"{start_hhmmss[5]}{start_hhmmss[4]}"
+            f"{start_hhmmss[3]}{start_hhmmss[2]}"
+            f"{start_hhmmss[1]}{start_hhmmss[0]}"
+        ).encode("ascii")
+        self.send_timer_command(0x82, encoded)
+
+    def timer_stop(self):
+        # Stop requires zeroed time payload fields: 0x80 + "000000" + CR/LF.
+        self.send_timer_command(0x80, b"000000")
+
+    def timer_reset(self):
+        # Reset command currently uses 0x80 + "000000" + CR/LF.
+        self.send_timer_command(0x80, b"000000")
+
+
+# -----------------------------
+# Collapse button
+# -----------------------------
+class CheckableComboBox(QComboBox):
+    """QComboBox with checkable items for multi-selection."""
+    selectionChanged = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self.setEditable(False)
+        self.view().pressed.connect(self._on_item_pressed)
+        self._update_text()
+
+    def addCheckItem(self, text: str, checked: bool = False):
+        item = QStandardItem(text)
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self._model.appendRow(item)
+        self._update_text()
+
+    def _on_item_pressed(self, index):
+        item = self._model.itemFromIndex(index)
+        if item is None:
+            return
+        item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def checkedItems(self) -> List[str]:
+        checked = []
+        for i in range(self._model.rowCount()):
+            item = self._model.item(i)
+            if item and item.checkState() == Qt.Checked:
+                checked.append(item.text())
+        return checked
+
+    def setCheckedItems(self, items: List[str]):
+        item_set = set(items)
+        for i in range(self._model.rowCount()):
+            item = self._model.item(i)
+            if item:
+                item.setCheckState(Qt.Checked if item.text() in item_set else Qt.Unchecked)
+        self._update_text()
+
+    def clearItems(self):
+        self._model.clear()
+        self._update_text()
+
+    def _update_text(self):
+        checked = self.checkedItems()
+        if checked:
+            self.setToolTip(", ".join(checked))
+        else:
+            self.setToolTip("No opponents selected")
+        # Show count summary in the combo display
+        if not checked:
+            display = "Select opponents..."
+        elif len(checked) <= 2:
+            display = ", ".join(checked)
+        else:
+            display = f"{checked[0]}, {checked[1]} +{len(checked) - 2} more"
+        # Use the combo's line edit or override paintEvent; simplest: set placeholder-like text
+        self.setCurrentIndex(-1)
+        # We'll show text via the combo's internal display
+        idx = self.findText(display)
+        if idx < 0:
+            self.setEditText(display) if self.isEditable() else None
+
+    def paintEvent(self, event):
+        """Override to show summary text instead of a single item."""
+        from PyQt5.QtWidgets import QStylePainter, QStyleOptionComboBox, QStyle
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        checked = self.checkedItems()
+        if not checked:
+            opt.currentText = "Select opponents..."
+        elif len(checked) <= 2:
+            opt.currentText = ", ".join(checked)
+        else:
+            opt.currentText = f"{checked[0]}, {checked[1]} +{len(checked) - 2} more"
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
+
+
+class CollapseButton(QPushButton):
+    """Small button that draws three stacked v-chevrons for collapse/expand."""
+
+    def __init__(self, expanded=True, parent=None):
+        super().__init__(parent)
+        self._expanded = expanded
+        self.setCheckable(True)
+        self.setChecked(expanded)
+        self.setFixedSize(24, 24)
+        self.setCursor(Qt.PointingHandCursor)
+        self.toggled.connect(self._on_toggled)
+
+    def _on_toggled(self, checked):
+        self._expanded = checked
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor("#1f5665"), 1.5))
+
+        cx = self.width() / 2
+        cy = self.height() / 2
+
+        if self._expanded:
+            # Three v chevrons pointing down, stacked vertically
+            for dy in [-6, 0, 6]:
+                y = cy + dy
+                p.drawLine(int(cx - 4), int(y - 2), int(cx), int(y + 2))
+                p.drawLine(int(cx), int(y + 2), int(cx + 4), int(y - 2))
+        else:
+            # Three > chevrons in a row (>>>)
+            for dx in [-7, 0, 7]:
+                x = cx + dx
+                p.drawLine(int(x - 2), int(cy - 3), int(x + 2), int(cy))
+                p.drawLine(int(x + 2), int(cy), int(x - 2), int(cy + 3))
+
+        p.end()
+
 
 # -----------------------------
 # GUI
@@ -511,6 +641,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Time Machine Downloader")
         self.resize(1700, 950)
+        self.text_scale = "large"
+        self.ui_scale = self._compute_ui_scale()
 
         self.last_raw_bytes = b""
         self.last_rows: List[ParsedRow] = []
@@ -521,19 +653,39 @@ class MainWindow(QMainWindow):
         self.live_current_heat = ""
         self.live_current_date = ""
         self.live_saw_live_time = False
+        self.live_in_retransmit = False
+        self.live_expect_retransmit_event = False
+        self.live_retransmit_event = ""
+        self.live_retransmit_heat = ""
 
         self.bib_lookup = {}  # bib -> {'first_name', 'last_name', 'gender', 'age_group', 'team_name'}
+        self.event_name_map = {}  # event_number_str -> event_name_str
+        self.event_meta_map = {}  # event_number_str -> {'gender': ..., 'age_group': ...}
+        self.home_team = "MountOlive"
+        self.opponent_teams: List[str] = []
+        self._table_bold = False        # toggles each time event or heat changes
+        self._table_last_group = None   # (event, heat) of the last rendered row
 
         self.live_task: Optional[asyncio.Task] = None
+        self.live_client: Optional[TimeMachineClient] = None
         self.download_task: Optional[asyncio.Task] = None
+        self.timer_running = False
+        self.lt_seen_counter = 0
+        self.last_lt_value = ""
 
         self.log_session_dir = self.create_log_session_dir()
         self.log_file_path = self.create_session_log_file()
         self.live_capture_log_path = self.create_live_capture_log_file()
+        self.session_results_csv_path = os.path.join(self.log_session_dir, "session_results.csv")
 
         self._build_ui()
         self.refresh_ports()
+        self._auto_load_events_csv()
+        self._auto_load_bib_csv()
         self.status.showMessage(f"Logging to {self.log_session_dir}")
+
+        # Auto-start live capture after event loop is running.
+        QTimer.singleShot(0, self.start_live_capture)
 
     # -----------------------------
     # Logging
@@ -582,36 +734,92 @@ class MainWindow(QMainWindow):
     # -----------------------------
     # UI
     # -----------------------------
+    def _compute_ui_scale(self) -> float:
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return 1.0
+
+        geo = screen.availableGeometry()
+        # Scale around a 1920x1080 baseline with conservative clamping.
+        scale_w = geo.width() / 1920.0
+        scale_h = geo.height() / 1080.0
+        return max(0.85, min(1.35, min(scale_w, scale_h)))
+
     def _build_ui(self):
         self._build_toolbar()
+        self._build_menu()
 
         central = QWidget()
+        central.setObjectName("centralRoot")
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
 
         split = QSplitter(Qt.Horizontal)
+        split.setHandleWidth(6)
         outer.addWidget(split)
 
+        # ── Left panel ──────────────────────────────────────────
         left = QWidget()
         left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
 
-        conn_group = QGroupBox("Connection")
-        conn_grid = QGridLayout(conn_group)
+        # --- Connection & Live Capture (combined) ---
+        self.conn_group = QGroupBox()
+        conn_layout = QVBoxLayout(self.conn_group)
+        conn_layout.setContentsMargins(6, 6, 6, 6)
+        conn_layout.setSpacing(4)
 
         self.port_combo = QComboBox()
-        self.refresh_ports_btn = QPushButton("Refresh")
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
         self.baud_combo.setCurrentText("9600")
 
-        conn_grid.addWidget(QLabel("COM Port"), 0, 0)
-        conn_grid.addWidget(self.port_combo, 0, 1)
-        conn_grid.addWidget(self.refresh_ports_btn, 0, 2)
-        conn_grid.addWidget(QLabel("Baud"), 1, 0)
-        conn_grid.addWidget(self.baud_combo, 1, 1)
+        self.live_led = QLabel()
+        self.live_led.setFixedSize(14, 14)
+        self.live_led.setObjectName("liveLed")
+        self._led_on = False
+        self._led_timer = QTimer(self)
+        self._led_timer.setInterval(500)
+        self._led_timer.timeout.connect(self._blink_led)
+        self._set_led(False)
 
-        dl_group = QGroupBox("Retransmit Download")
-        dl_grid = QGridLayout(dl_group)
+        self.live_start_btn = QPushButton("Start")
+        self.live_start_btn.setProperty("kind", "accent")
+        self.live_stop_btn = QPushButton("Stop")
+        self.live_stop_btn.setProperty("kind", "danger")
+        self.live_stop_btn.setEnabled(False)
+
+        port_row = QHBoxLayout()
+        port_row.setSpacing(6)
+        port_row.addWidget(QLabel("Port"))
+        port_row.addWidget(self.port_combo, 1)
+
+        baud_row = QHBoxLayout()
+        baud_row.setSpacing(6)
+        baud_row.addWidget(QLabel("Baud"))
+        baud_row.addWidget(self.baud_combo, 1)
+        live_status_label = QLabel("LIVE")
+        live_status_label.setObjectName("liveLedLabel")
+        baud_row.addWidget(self.live_led)
+        baud_row.addWidget(live_status_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        btn_row.addWidget(self.live_start_btn, 1)
+        btn_row.addWidget(self.live_stop_btn, 1)
+
+        conn_layout.addLayout(port_row)
+        conn_layout.addLayout(baud_row)
+        conn_layout.addLayout(btn_row)
+
+        # --- Event / Heat / Download ---
+        self.dl_group = QGroupBox()
+        dl_grid = QGridLayout(self.dl_group)
+        dl_grid.setHorizontalSpacing(6)
+        dl_grid.setVerticalSpacing(4)
 
         self.event_spin = QSpinBox()
         self.event_spin.setRange(1, 999)
@@ -625,57 +833,186 @@ class MainWindow(QMainWindow):
         self.read_seconds_spin.setRange(0.5, 60.0)
         self.read_seconds_spin.setSingleStep(0.5)
         self.read_seconds_spin.setDecimals(1)
-        self.read_seconds_spin.setValue(5.0)
+        self.read_seconds_spin.setValue(60.0)
 
-        self.download_btn = QPushButton("Download Selected Event / Heat")
+        self.set_event_heat_btn = QPushButton("Set E/H")
+        self.set_event_heat_btn.setProperty("kind", "secondary")
 
-        self.set_event_heat_btn = QPushButton("Set Event/Heat")
+        self.download_btn = QPushButton("Download")
+        self.download_btn.setProperty("kind", "primary")
+
+        compact_field_w = int(72 * self.ui_scale)
+        self.event_spin.setMaximumWidth(compact_field_w)
+        self.heat_spin.setMaximumWidth(compact_field_w)
+        self.read_seconds_spin.setMaximumWidth(int(80 * self.ui_scale))
 
         dl_grid.addWidget(QLabel("Event"), 0, 0)
         dl_grid.addWidget(self.event_spin, 0, 1)
-        dl_grid.addWidget(QLabel("Heat"), 1, 0)
-        dl_grid.addWidget(self.heat_spin, 1, 1)
-        dl_grid.addWidget(QLabel("Read Seconds"), 2, 0)
-        dl_grid.addWidget(self.read_seconds_spin, 2, 1)
-        dl_grid.addWidget(self.set_event_heat_btn, 3, 0, 1, 2)
-        dl_grid.addWidget(self.download_btn, 4, 0, 1, 2)
+        dl_grid.addWidget(QLabel("Heat"), 0, 2)
+        dl_grid.addWidget(self.heat_spin, 0, 3)
+        dl_grid.addWidget(QLabel("Timeout"), 1, 0)
+        dl_grid.addWidget(self.read_seconds_spin, 1, 1)
+        dl_grid.addWidget(self.set_event_heat_btn, 1, 2)
+        dl_grid.addWidget(self.download_btn, 1, 3)
 
-        bib_group = QGroupBox("Bib Lookup / Assignment")
-        bib_grid = QGridLayout(bib_group)
+        # --- Timer Control ---
+        self.timer_group = QGroupBox()
+        timer_grid = QGridLayout(self.timer_group)
+        timer_grid.setHorizontalSpacing(6)
+        timer_grid.setVerticalSpacing(4)
 
+        self.timer_toggle_btn = QPushButton("Start Timer")
+        self.timer_toggle_btn.setProperty("kind", "accent")
+        self.timer_reset_btn = QPushButton("Reset")
+        self.timer_reset_btn.setProperty("kind", "secondary")
+        self.timer_start_time_input = QLineEdit("000000")
+        self.timer_start_time_input.setPlaceholderText("HHMMSS")
+        self.timer_start_time_input.setMaxLength(6)
+        self.timer_start_time_input.setMaximumWidth(int(80 * self.ui_scale))
+        self.timer_start_time_input.setAlignment(Qt.AlignCenter)
+        self.timer_log_text = QTextEdit()
+        self.timer_log_text.setObjectName("timerLogText")
+        self.timer_log_text.setReadOnly(True)
+        self.timer_log_text.setMaximumHeight(80)
+        self.timer_log_text.setLineWrapMode(QTextEdit.WidgetWidth)
+
+        timer_grid.addWidget(QLabel("Start"), 0, 0)
+        timer_grid.addWidget(self.timer_start_time_input, 0, 1)
+        timer_grid.addWidget(self.timer_toggle_btn, 0, 2)
+        timer_grid.addWidget(self.timer_reset_btn, 0, 3)
+        timer_grid.addWidget(self.timer_log_text, 1, 0, 1, 4)
+
+        # --- Bib Lookup ---
+        self.bib_group = QGroupBox()
+        bib_layout = QVBoxLayout(self.bib_group)
+        bib_layout.setContentsMargins(6, 6, 6, 6)
+        bib_layout.setSpacing(4)
+
+        bib_row = QHBoxLayout()
         self.load_bib_csv_btn = QPushButton("Load Bib CSV")
-        self.bib_csv_label = QLabel("No CSV loaded")
-        self.bib_allowed_label = QLabel("Allowed age groups: N/A")
+        self.load_bib_csv_btn.setProperty("kind", "secondary")
+        self.bib_csv_label = QLabel("No bib CSV loaded")
+        self.bib_csv_label.setObjectName("bibCsvLabel")
+        bib_row.addWidget(self.load_bib_csv_btn)
+        bib_row.addWidget(self.bib_csv_label)
+        bib_row.addStretch()
+
+        events_row = QHBoxLayout()
+        self.upload_events_btn = QPushButton("Upload Events")
+        self.upload_events_btn.setProperty("kind", "secondary")
+        self.upload_events_btn.setToolTip(
+            "Load a CSV mapping event numbers to event names.\n"
+            "Required columns: event number, event name\n"
+            "Example:\n  event number,event name\n  1,800m\n  7,4x100 relay\n  13,100m"
+        )
+        self.events_csv_help_btn = QPushButton("?")
+        self.events_csv_help_btn.setFixedWidth(24)
+        self.events_csv_help_btn.setProperty("kind", "secondary")
+        self.events_csv_help_btn.setToolTip("Show expected CSV format")
+        self.events_csv_label = QLabel("No events CSV loaded")
+        self.events_csv_label.setObjectName("eventsCsvLabel")
+        events_row.addWidget(self.upload_events_btn)
+        events_row.addWidget(self.events_csv_help_btn)
+        events_row.addWidget(self.events_csv_label)
+        events_row.addStretch()
+
+        bib_layout.addLayout(bib_row)
+        bib_layout.addLayout(events_row)
+
+        # Home team selector
+        home_row = QHBoxLayout()
+        home_row.setSpacing(6)
+        home_lbl = QLabel("Home:")
+        home_lbl.setFixedWidth(60)
+        self.home_team_combo = QComboBox()
+        self.home_team_combo.setEditable(True)
+        self.home_team_combo.addItem("MountOlive")
+        self.home_team_combo.setCurrentText("MountOlive")
+        home_row.addWidget(home_lbl)
+        home_row.addWidget(self.home_team_combo, 1)
+        bib_layout.addLayout(home_row)
+
+        # Opponent team selector (checkable dropdown)
+        opp_row = QHBoxLayout()
+        opp_row.setSpacing(6)
+        opp_lbl = QLabel("Opponents:")
+        opp_lbl.setFixedWidth(60)
+        self.opponent_combo = CheckableComboBox()
+        opp_row.addWidget(opp_lbl)
+        opp_row.addWidget(self.opponent_combo, 1)
+        bib_layout.addLayout(opp_row)
+
+        self.bib_allowed_label = QLabel("")
+        self.bib_allowed_label.setObjectName("bibAgeLabel")
+        # Keep these widgets alive for compatibility with existing logic
         self.bib_lane_spin = QSpinBox()
         self.bib_lane_spin.setRange(1, 99)
+        self.bib_lane_spin.setVisible(False)
         self.bib_bib_combo = QComboBox()
         self.bib_bib_combo.setEnabled(False)
         self.bib_bib_combo.addItem("Load bib CSV first", "")
-        self.bib_assign_btn = QPushButton("Assign Bib to Lane")
+        self.bib_bib_combo.setVisible(False)
+        self.bib_assign_btn = QPushButton("Assign")
+        self.bib_assign_btn.setProperty("kind", "primary")
+        self.bib_assign_btn.setVisible(False)
 
-        bib_grid.addWidget(self.load_bib_csv_btn, 0, 0, 1, 2)
-        bib_grid.addWidget(self.bib_csv_label, 1, 0, 1, 2)
-        bib_grid.addWidget(self.bib_allowed_label, 2, 0, 1, 2)
-        bib_grid.addWidget(QLabel("Lane"), 3, 0)
-        bib_grid.addWidget(self.bib_lane_spin, 3, 1)
-        bib_grid.addWidget(QLabel("Bib"), 4, 0)
-        bib_grid.addWidget(self.bib_bib_combo, 4, 1)
-        bib_grid.addWidget(self.bib_assign_btn, 5, 0, 1, 2)
+        compact_mode = self.ui_scale <= 0.95
 
-        live_group = QGroupBox("Live Capture")
-        live_grid = QGridLayout(live_group)
+        left_layout.addWidget(self._make_collapsible_section("Connection & Live", self.conn_group))
+        left_layout.addWidget(self._make_collapsible_section("Event / Heat", self.dl_group))
+        left_layout.addWidget(self._make_collapsible_section("Timer", self.timer_group))
+        left_layout.addWidget(self._make_collapsible_section("Config", self.bib_group, not compact_mode))
+        left_layout.addStretch(1)
 
-        self.live_start_btn = QPushButton("Start Live Capture")
-        self.live_stop_btn = QPushButton("Stop Live Capture")
-        self.live_stop_btn.setEnabled(False)
+        # ── Right panel ─────────────────────────────────────────
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
 
-        live_grid.addWidget(self.live_start_btn, 0, 0)
-        live_grid.addWidget(self.live_stop_btn, 0, 1)
+        right_split = QSplitter(Qt.Vertical)
+        right_split.setHandleWidth(6)
 
-        raw_group = QGroupBox("Raw Display Mode")
-        raw_layout = QVBoxLayout(raw_group)
+        table_group = QGroupBox("Parsed Results")
+        table_layout = QVBoxLayout(table_group)
 
-        self.cleaned_ascii_radio = QRadioButton("Cleaned ASCII")
+        self.event_heat_banner = QLabel("Event: —   Heat: —")
+        self.event_heat_banner.setObjectName("eventHeatBanner")
+        self.event_heat_banner.setAlignment(Qt.AlignCenter)
+        self.event_heat_banner.setStyleSheet(
+            "font-weight: bold; font-size: 13pt; padding: 4px 8px;"
+            "background: palette(midlight); border-radius: 4px;"
+        )
+        table_layout.addWidget(self.event_heat_banner)
+
+        self.table = QTableWidget(0, 14)
+        self.table.setHorizontalHeaderLabels(
+            ["Date", "Event", "Event \nType", "Heat", "Lane", "Team", "Bib", "First \nName", "Last \nName", "Gender", "Age \nGroup", "Place/\nLap", "Finish\nTime", "Split \nTime"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.table.horizontalHeader().setMinimumSectionSize(50)
+        self.table.setSortingEnabled(True)
+        self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed | QTableWidget.AnyKeyPressed)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        compact_row_h = max(22, int(24 * self.ui_scale))
+        self.table.verticalHeader().setDefaultSectionSize(compact_row_h)
+        self.table.verticalHeader().setMinimumSectionSize(max(20, compact_row_h - 2))
+        self.table.cellChanged.connect(self.on_table_cell_changed)
+        table_layout.addWidget(self.table)
+
+        # Raw output with inline display-mode toggle
+        raw_out_group = QGroupBox("Raw Output")
+        raw_out_layout = QVBoxLayout(raw_out_group)
+        raw_out_layout.setSpacing(4)
+
+        raw_mode_row = QHBoxLayout()
+        raw_mode_row.setContentsMargins(0, 0, 0, 0)
+        raw_mode_row.setSpacing(10)
+
+        self.cleaned_ascii_radio = QRadioButton("ASCII")
         self.cleaned_ascii_radio.setChecked(True)
         self.hex_radio = QRadioButton("Hex")
         self.wrap_check = QCheckBox("Wrap")
@@ -685,37 +1022,12 @@ class MainWindow(QMainWindow):
         self.raw_mode_group.addButton(self.cleaned_ascii_radio)
         self.raw_mode_group.addButton(self.hex_radio)
 
-        raw_layout.addWidget(self.cleaned_ascii_radio)
-        raw_layout.addWidget(self.hex_radio)
-        raw_layout.addWidget(self.wrap_check)
+        raw_mode_row.addWidget(self.cleaned_ascii_radio)
+        raw_mode_row.addWidget(self.hex_radio)
+        raw_mode_row.addWidget(self.wrap_check)
+        raw_mode_row.addStretch()
+        raw_out_layout.addLayout(raw_mode_row)
 
-        left_layout.addWidget(conn_group)
-        left_layout.addWidget(dl_group)
-        left_layout.addWidget(bib_group)
-        left_layout.addWidget(live_group)
-        left_layout.addWidget(raw_group)
-        left_layout.addStretch(1)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-
-        right_split = QSplitter(Qt.Vertical)
-
-        table_group = QGroupBox("Parsed Results")
-        table_layout = QVBoxLayout(table_group)
-
-        self.table = QTableWidget(0, 14)
-        self.table.setHorizontalHeaderLabels(
-            ["Date", "Event", "Event Type", "Heat", "Lane", "Team", "Bib", "First Name", "Last Name", "Gender", "Age Group", "Lap", "Cumulative", "Lap Time"]
-        )
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setSortingEnabled(True)
-        self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed | QTableWidget.AnyKeyPressed)
-        self.table.cellChanged.connect(self.on_table_cell_changed)
-        table_layout.addWidget(self.table)
-
-        raw_out_group = QGroupBox("Raw Output")
-        raw_out_layout = QVBoxLayout(raw_out_group)
         self.raw_text = QTextEdit()
         self.raw_text.setReadOnly(True)
         self.raw_text.setLineWrapMode(QTextEdit.NoWrap)
@@ -729,24 +1041,33 @@ class MainWindow(QMainWindow):
 
         split.addWidget(left)
         split.addWidget(right)
-        split.setSizes([300, 1400])
+        split.setSizes([280, 1420])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        self.refresh_ports_btn.clicked.connect(self.refresh_ports)
         self.cleaned_ascii_radio.toggled.connect(self.update_raw_view)
         self.hex_radio.toggled.connect(self.update_raw_view)
         self.wrap_check.toggled.connect(self.update_wrap_mode)
 
         self.load_bib_csv_btn.clicked.connect(self.load_bib_csv)
+        self.upload_events_btn.clicked.connect(self.load_events_csv)
+        self.events_csv_help_btn.clicked.connect(self.show_events_csv_format_help)
         self.bib_assign_btn.clicked.connect(self.assign_bib_to_lane)
         self.event_spin.valueChanged.connect(self.on_event_selection_changed)
+        self.home_team_combo.currentTextChanged.connect(self._on_home_team_changed)
+        self.opponent_combo.selectionChanged.connect(self._on_opponents_changed)
 
         self.set_event_heat_btn.clicked.connect(self.set_event_heat_selected)
         self.download_btn.clicked.connect(self.download_selected)
-        self.live_start_btn.clicked.connect(self.on_live_start_clicked)
-        self.live_stop_btn.clicked.connect(self.on_live_stop_clicked)
+        self.live_start_btn.clicked.connect(self.start_live_capture)
+        self.live_stop_btn.clicked.connect(self.stop_live_capture)
+        self.timer_toggle_btn.clicked.connect(self.on_timer_toggle_clicked)
+        self.timer_reset_btn.clicked.connect(self.on_timer_reset_clicked)
+
+        self._apply_professional_theme()
 
     def on_live_start_clicked(self):
         self.start_live_capture()
@@ -754,8 +1075,42 @@ class MainWindow(QMainWindow):
     def on_live_stop_clicked(self):
         self.stop_live_capture()
 
+    def on_timer_toggle_clicked(self):
+        self.toggle_timer()
+
+    def on_timer_reset_clicked(self):
+        self.reset_timer()
+
+    def _set_led(self, on: bool):
+        color = "#e03030" if on else "#4a2020"
+        self.live_led.setStyleSheet(
+            f"background: {color}; border: 1px solid #8a3030; border-radius: 8px;"
+        )
+
+    def _blink_led(self):
+        self._led_on = not self._led_on
+        self._set_led(self._led_on)
+
+    def _update_timer_button_visual(self):
+        if self.timer_running:
+            self.timer_toggle_btn.setText("Stop Timer")
+            self.timer_toggle_btn.setProperty("kind", "danger")
+        else:
+            self.timer_toggle_btn.setText("Start Timer")
+            self.timer_toggle_btn.setProperty("kind", "accent")
+
+        self.timer_toggle_btn.style().unpolish(self.timer_toggle_btn)
+        self.timer_toggle_btn.style().polish(self.timer_toggle_btn)
+
+    def log_timer_command(self, message: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.timer_log_text.append(f"[{ts}] {message}")
+        bar = self.timer_log_text.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
     def _build_toolbar(self):
         toolbar = QToolBar("Main")
+        toolbar.setObjectName("mainToolbar")
         self.addToolBar(toolbar)
 
         save_csv_action = QAction("Save Table CSV", self)
@@ -769,6 +1124,530 @@ class MainWindow(QMainWindow):
         clear_action = QAction("Clear", self)
         clear_action.triggered.connect(self.clear_results)
         toolbar.addAction(clear_action)
+
+    def _make_collapsible_section(self, title: str, group: QGroupBox, expanded: bool = True) -> QWidget:
+        """Wrap a QGroupBox in a collapsible section with a CollapseButton header."""
+        group.setTitle("")
+
+        section = QWidget()
+        section.setObjectName("collapsibleSection")
+        v_layout = QVBoxLayout(section)
+        v_layout.setContentsMargins(0, 0, 0, 0)
+        v_layout.setSpacing(2)
+
+        header = QWidget()
+        header.setObjectName("sectionHeader")
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(12, 4, 12, 4)
+        h_layout.setSpacing(8)
+
+        btn = CollapseButton(expanded)
+        btn.setObjectName("collapseBtn")
+        lbl = QLabel(title)
+        lbl.setObjectName("sectionTitle")
+
+        h_layout.addWidget(btn)
+        h_layout.addWidget(lbl)
+        h_layout.addStretch()
+
+        group.setVisible(expanded)
+        btn.toggled.connect(group.setVisible)
+        header.setCursor(Qt.PointingHandCursor)
+        header.mousePressEvent = lambda e: btn.toggle()
+
+        v_layout.addWidget(header)
+        v_layout.addWidget(group)
+
+        return section
+
+    def _build_menu(self):
+        menu = self.menuBar()
+        view_menu = menu.addMenu("View")
+        text_size_menu = view_menu.addMenu("Text Size")
+
+        self.text_size_group = QActionGroup(self)
+        self.text_size_group.setExclusive(True)
+        self.text_size_actions = {}
+
+        options = [
+            ("Small", "small"),
+            ("Medium", "medium"),
+            ("Large", "large"),
+            ("Extra Large", "xlarge"),
+        ]
+
+        for label, value in options:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, v=value: self.set_text_scale(v))
+            self.text_size_group.addAction(action)
+            text_size_menu.addAction(action)
+            self.text_size_actions[value] = action
+
+        self.text_size_actions[self.text_scale].setChecked(True)
+
+    def set_text_scale(self, scale: str):
+        if scale not in {"small", "medium", "large", "xlarge"}:
+            return
+
+        self.text_scale = scale
+        self._apply_professional_theme()
+
+        if hasattr(self, "text_size_actions"):
+            self.text_size_actions[scale].setChecked(True)
+
+        if hasattr(self, "status"):
+            self.status.showMessage(f"Text size set to {scale.title()}")
+
+    def _timer_action_blocked(self) -> bool:
+        if self.download_task and not self.download_task.done():
+            QMessageBox.warning(self, "Download Active", "Wait for the current download to finish before sending timer control commands.")
+            self.log_timer_command("Blocked: download in progress")
+            return True
+
+        return False
+
+    async def _wait_for_lt_confirmation(self, client: TimeMachineClient, timeout_seconds: float = 1.5) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        start_counter = self.lt_seen_counter
+
+        while asyncio.get_running_loop().time() < deadline:
+            # If live loop parsed a new LT line, confirmation is complete.
+            if self.lt_seen_counter > start_counter:
+                return True
+
+            # When not in live capture, read directly for LT confirmation.
+            if not (self.live_task and not self.live_task.done() and client is self.live_client):
+                chunk = await self._read_available_once(client)
+                if chunk:
+                    text = sanitize_device_bytes(chunk)
+                    m = HEADER_LT_RE.search(text)
+                    if m:
+                        self.last_lt_value = m.group(1)
+                        self.lt_seen_counter += 1
+                        return True
+
+            await asyncio.sleep(0.02)
+
+        return False
+
+    @asyncSlot()
+    async def toggle_timer(self):
+        if self._timer_action_blocked():
+            return
+
+        port = self.selected_port()
+        if not port:
+            QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
+            self.log_timer_command("Blocked: no COM port selected")
+            return
+
+        self.timer_toggle_btn.setEnabled(False)
+        client = None
+        using_live_connection = False
+        try:
+            if self._has_live_connection():
+                client = self.live_client
+                using_live_connection = True
+            else:
+                client = await self._open_client(port, self.selected_baud(), 0.2)
+
+            if self.timer_running:
+                await asyncio.to_thread(client.timer_stop)
+                self.timer_running = False
+                self.status.showMessage("Timer stop command sent (0x80 + 000000 + CR/LF)")
+                if using_live_connection:
+                    self.log_timer_command("Sent STOP on live COM: 0x80 + 000000 + CR/LF")
+                else:
+                    self.log_timer_command("Sent STOP: 0x80 + 000000 + CR/LF")
+            else:
+                start_hhmmss = self.timer_start_time_input.text().strip()
+                if len(start_hhmmss) != 6 or not start_hhmmss.isdigit():
+                    raise ValueError("Start time must be 6 digits in HHMMSS format")
+
+                event_num, heat_num = self.get_current_or_default_event_heat()
+                self.event_spin.setValue(event_num)
+                self.heat_spin.setValue(heat_num)
+                await asyncio.to_thread(client.set_event_heat, event_num, heat_num)
+
+                encoded = (
+                    f"{start_hhmmss[5]}{start_hhmmss[4]}"
+                    f"{start_hhmmss[3]}{start_hhmmss[2]}"
+                    f"{start_hhmmss[1]}{start_hhmmss[0]}"
+                )
+
+                await asyncio.to_thread(client.timer_start, start_hhmmss)
+                confirmed = await self._wait_for_lt_confirmation(client, 1.5)
+                if not confirmed:
+                    self.timer_running = False
+                    self._update_timer_button_visual()
+                    self.status.showMessage("Timer start not confirmed")
+                    self.log_timer_command("Start failed: LT confirmation not received")
+                    QMessageBox.critical(
+                        self,
+                        "Timer Start Failed",
+                        "Timer start was not confirmed. Expected an LT message such as 'LT 00:00:00.03'.",
+                    )
+                    return
+
+                self.timer_running = True
+                self.status.showMessage("Timer start confirmed by LT message")
+                if using_live_connection:
+                    self.log_timer_command(
+                        f"Set E/H {event_num:03d}/{heat_num:02d}; START on live COM: 0x82 + {encoded} + CR/LF | confirmed LT {self.last_lt_value}"
+                    )
+                else:
+                    self.log_timer_command(
+                        f"Set E/H {event_num:03d}/{heat_num:02d}; START: 0x82 + {encoded} + CR/LF | confirmed LT {self.last_lt_value}"
+                    )
+
+            self._update_timer_button_visual()
+        except Exception as e:
+            QMessageBox.critical(self, "Timer Control Error", str(e))
+            self.status.showMessage("Failed to send timer start/stop command")
+            self.log_timer_command(f"Error (start/stop): {e}")
+        finally:
+            if client is not None and not using_live_connection:
+                await asyncio.to_thread(client.close)
+            self.timer_toggle_btn.setEnabled(True)
+
+    @asyncSlot()
+    async def reset_timer(self):
+        if self._timer_action_blocked():
+            return
+
+        port = self.selected_port()
+        if not port:
+            QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
+            self.log_timer_command("Blocked: no COM port selected")
+            return
+
+        self.timer_reset_btn.setEnabled(False)
+        client = None
+        using_live_connection = False
+        try:
+            if self._has_live_connection():
+                client = self.live_client
+                using_live_connection = True
+            else:
+                client = await self._open_client(port, self.selected_baud(), 0.2)
+
+            await asyncio.to_thread(client.timer_reset)
+            self.timer_running = False
+            self._update_timer_button_visual()
+            self.status.showMessage("Timer reset command sent (0x80 + 000000 + CR/LF)")
+            if using_live_connection:
+                self.log_timer_command("Sent RESET on live COM: 0x80 + 000000 + CR/LF")
+            else:
+                self.log_timer_command("Sent RESET: 0x80 + 000000 + CR/LF")
+        except Exception as e:
+            QMessageBox.critical(self, "Timer Reset Error", str(e))
+            self.status.showMessage("Failed to send timer reset command")
+            self.log_timer_command(f"Error (reset): {e}")
+        finally:
+            if client is not None and not using_live_connection:
+                await asyncio.to_thread(client.close)
+            self.timer_reset_btn.setEnabled(True)
+
+    def _apply_professional_theme(self):
+        control_h = max(28, int(32 * self.ui_scale))
+        button_h = max(32, int(36 * self.ui_scale))
+        input_padding_v = max(3, int(4 * self.ui_scale))
+        input_padding_h = max(8, int(10 * self.ui_scale))
+
+        size_map = {
+            "small": {
+                "base": 10,
+                "group": 12,
+                "label": 12,
+                "input": 12,
+                "radio": 12,
+                "table": 11,
+                "header": 11,
+                "raw": 13,
+            },
+            "medium": {
+                "base": 11,
+                "group": 13,
+                "label": 13,
+                "input": 13,
+                "radio": 13,
+                "table": 12,
+                "header": 12,
+                "raw": 15,
+            },
+            "large": {
+                "base": 13,
+                "group": 15,
+                "label": 15,
+                "input": 15,
+                "radio": 15,
+                "table": 14,
+                "header": 14,
+                "raw": 18,
+            },
+            "xlarge": {
+                "base": 14,
+                "group": 16,
+                "label": 16,
+                "input": 16,
+                "radio": 16,
+                "table": 15,
+                "header": 15,
+                "raw": 20,
+            },
+        }
+        sizes = size_map.get(self.text_scale, size_map["medium"])
+
+        # Apply one cohesive stylesheet to keep every control visually consistent.
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                            stop:0 #f3f7fb, stop:1 #eaf4f1);
+            }}
+
+            QWidget#centralRoot {{
+                background: transparent;
+            }}
+
+            QWidget#sectionHeader {{
+                background: #dff0f6;
+                border: 1px solid #b6d0d9;
+                border-radius: 10px;
+            }}
+
+            QLabel#sectionTitle {{
+                color: #0f4f5e;
+                font-weight: 700;
+                font-size: {sizes['group']}px;
+                background: transparent;
+                border: none;
+            }}
+
+            QPushButton#collapseBtn {{
+                border: none;
+                background: transparent;
+                min-height: 0px;
+                padding: 0px;
+            }}
+
+            QGroupBox {{
+                color: #123640;
+                font-size: {sizes['group']}px;
+                font-weight: 700;
+                border: 1px solid #b6d0d9;
+                border-radius: 10px;
+                margin-top: 0px;
+                padding: 8px;
+                background: #f9fcfd;
+            }}
+
+            QGroupBox::title {{
+                height: 0px;
+                padding: 0px;
+                margin: 0px;
+            }}
+
+            QLabel {{
+                color: #24424c;
+                font-size: {sizes['label']}px;
+            }}
+
+            QLabel#liveLedLabel {{
+                color: #9c4a2e;
+                font-weight: 700;
+                font-size: {sizes['label']}px;
+            }}
+
+            QLabel#bibCsvLabel, QLabel#bibAgeLabel {{
+                color: #5a7a84;
+                font-size: {max(sizes['label'] - 2, 10)}px;
+            }}
+
+            QTextEdit#timerLogText {{
+                background: #f4fafc;
+                border: 1px solid #bfd8e0;
+                border-radius: 8px;
+                color: #1a4550;
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: {sizes['table']}px;
+            }}
+
+            QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{
+                border: 1px solid #b6d0d9;
+                border-radius: 8px;
+                background: #ffffff;
+                color: #14333d;
+                min-height: {control_h}px;
+                padding: {input_padding_v}px {input_padding_h}px;
+                selection-background-color: #2c9fbf;
+                font-size: {sizes['input']}px;
+            }}
+
+            QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QLineEdit:hover {{
+                border: 1px solid #7eb7c7;
+            }}
+
+            QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {{
+                border: 2px solid #2c9fbf;
+            }}
+
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 26px;
+                border-left: 1px solid #c7dde4;
+                border-top-right-radius: 8px;
+                border-bottom-right-radius: 8px;
+                background: #eef7fa;
+            }}
+
+            QComboBox QAbstractItemView {{
+                border: 1px solid #9ec5d2;
+                selection-background-color: #d9eef5;
+                selection-color: #123640;
+                background: #ffffff;
+            }}
+
+            QPushButton {{
+                border-radius: 9px;
+                border: 1px solid #4f8fa3;
+                min-height: {button_h}px;
+                padding: {input_padding_v + 1}px {input_padding_h + 4}px;
+                font-weight: 600;
+                color: #10353f;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #f8fdff, stop:1 #d9ecf3);
+            }}
+
+            QPushButton:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #ffffff, stop:1 #cde7f0);
+            }}
+
+            QPushButton:pressed {{
+                padding-top: 7px;
+                padding-left: 15px;
+                background: #c1e0ea;
+            }}
+
+            QPushButton[kind="primary"] {{
+                color: #ffffff;
+                border: 1px solid #1f6a80;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #2f95b3, stop:1 #216f86);
+            }}
+
+            QPushButton[kind="primary"]:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #3ba3c3, stop:1 #247892);
+            }}
+
+            QPushButton[kind="accent"] {{
+                color: #ffffff;
+                border: 1px solid #1f7c65;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #31af8d, stop:1 #1f8a6e);
+            }}
+
+            QPushButton[kind="accent"]:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #39c19b, stop:1 #239477);
+            }}
+
+            QPushButton[kind="danger"] {{
+                color: #ffffff;
+                border: 1px solid #9c4a2e;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #d87952, stop:1 #b85f39);
+            }}
+
+            QPushButton[kind="danger"]:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #e18861, stop:1 #c86840);
+            }}
+
+            QPushButton:disabled {{
+                color: #6e8a93;
+                background: #e6edf0;
+                border: 1px solid #c8d6db;
+            }}
+
+            QRadioButton, QCheckBox {{
+                color: #28464f;
+                spacing: 8px;
+                font-size: {sizes['radio']}px;
+            }}
+
+            QTableWidget {{
+                border: 1px solid #b7cfd8;
+                border-radius: 10px;
+                background: #ffffff;
+                alternate-background-color: #f4fbfe;
+                gridline-color: #d6e5ea;
+                color: #17313a;
+                selection-background-color: #bfe4ef;
+                selection-color: #102a32;
+                font-size: {sizes['table']}px;
+                padding: 0px;
+            }}
+
+            QTableWidget::item {{
+                padding: 0px 2px;
+            }}
+
+            QHeaderView::section {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #e7f5fb, stop:1 #d4e9f2);
+                color: #114451;
+                border: 0px;
+                border-right: 1px solid #bcd4dd;
+                border-bottom: 1px solid #bcd4dd;
+                padding: 2px 2px;
+                font-weight: 700;
+                font-size: {sizes['header']}px;
+            }}
+
+            QTextEdit {{
+                border: 1px solid #b7cfd8;
+                border-radius: 10px;
+                background: #f9fdff;
+                color: #123640;
+                selection-background-color: #d6edf6;
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: {sizes['raw']}px;
+            }}
+
+            QToolBar#mainToolbar {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                            stop:0 #ecf7fb, stop:1 #dbeef5);
+                border: 1px solid #b9d2db;
+                border-radius: 10px;
+                spacing: 8px;
+                padding: 5px;
+            }}
+
+            QToolButton {{
+                color: #114451;
+                border-radius: 7px;
+                padding: 5px 10px;
+                font-weight: 600;
+                background: transparent;
+            }}
+
+            QToolButton:hover {{
+                background: #cfe8f1;
+            }}
+
+            QStatusBar {{
+                background: #f2f8fa;
+                color: #2a4d57;
+                border-top: 1px solid #cadde4;
+            }}
+        """)
+
+        base_font = QFont("Segoe UI", sizes["base"])
+        self.setFont(base_font)
 
     # -----------------------------
     # Port helpers
@@ -815,7 +1694,11 @@ class MainWindow(QMainWindow):
     def get_event_allowed_age_groups(self, event_num: int) -> List[str]:
         if event_num < 1:
             return []
-
+        for key in (str(event_num), str(event_num).zfill(3)):
+            meta = self.event_meta_map.get(key)
+            if meta and meta.get("age_group"):
+                return [meta["age_group"]]
+        # Fallback if no CSV loaded
         age_group_cycle = ["9&10", "11&12", "13-15", "16-18"]
         return [age_group_cycle[(event_num - 1) % len(age_group_cycle)]]
 
@@ -856,6 +1739,41 @@ class MainWindow(QMainWindow):
     def on_event_selection_changed(self, value: int):
         self.update_bib_dropdown_options()
 
+    def _sync_event_heat_controls(self):
+        if self.live_current_event.isdigit():
+            event_num = min(max(int(self.live_current_event), 1), 999)
+            if self.event_spin.value() != event_num:
+                self.event_spin.setValue(event_num)
+
+        if self.live_current_heat.isdigit():
+            heat_num = min(max(int(self.live_current_heat), 1), 99)
+            if self.heat_spin.value() != heat_num:
+                self.heat_spin.setValue(heat_num)
+
+    def get_current_or_default_event_heat(self) -> Tuple[int, int]:
+        event_text = (self.live_current_event or "").strip()
+        heat_text = (self.live_current_heat or "").strip()
+
+        if not event_text or not heat_text:
+            for row in reversed(self.last_rows):
+                if (not event_text) and row.event.isdigit():
+                    event_text = row.event
+                if (not heat_text) and row.heat.isdigit():
+                    heat_text = row.heat
+                if event_text and heat_text:
+                    break
+
+        if not event_text and self.event_spin.value() >= 1:
+            event_text = str(self.event_spin.value())
+        if not heat_text and self.heat_spin.value() >= 1:
+            heat_text = str(self.heat_spin.value())
+
+        event_num = int(event_text) if event_text.isdigit() else 1
+        heat_num = int(heat_text) if heat_text.isdigit() else 1
+        event_num = min(max(event_num, 1), 999)
+        heat_num = min(max(heat_num, 1), 99)
+        return event_num, heat_num
+
     # -----------------------------
     # Async serial helpers
     # -----------------------------
@@ -869,6 +1787,13 @@ class MainWindow(QMainWindow):
             serial.STOPBITS_ONE,
             timeout,
             0.01,
+        )
+
+    def _has_live_connection(self) -> bool:
+        return (
+            self.live_client is not None
+            and self.live_client.ser is not None
+            and self.live_client.ser.is_open
         )
 
     async def _read_available_once(self, client: TimeMachineClient) -> bytes:
@@ -893,6 +1818,22 @@ class MainWindow(QMainWindow):
 
         return bytes(out)
 
+    async def _wait_for_retransmit_markers_in_live(self, start_index: int, timeout_seconds: float) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        saw_start = False
+
+        while asyncio.get_running_loop().time() < deadline:
+            chunk = bytes(self.live_raw_buffer[start_index:])
+            if chunk:
+                text = sanitize_device_bytes(chunk).upper()
+                if "START OF RETRANSMIT" in text:
+                    saw_start = True
+                if saw_start and "END OF RETRANSMIT" in text:
+                    return True
+            await asyncio.sleep(0.02)
+
+        return False
+
     async def _live_capture_loop(self, client: TimeMachineClient):
         self.status.showMessage("Live capture running")
         try:
@@ -915,10 +1856,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
             return
 
-        if self.live_task and not self.live_task.done():
-            QMessageBox.warning(self, "Live Capture Active", "Stop live capture before doing a retransmit download.")
-            return
-
         if self.download_task and not self.download_task.done():
             return
 
@@ -932,28 +1869,48 @@ class MainWindow(QMainWindow):
 
         client = None
         try:
-            client = await self._open_client(port, self.selected_baud(), 0.2)
+            if self._has_live_connection():
+                client = self.live_client
+                start_index = len(self.live_raw_buffer)
+                before = sum(1 for r in self.last_rows if r.row_type == "result")
 
-            await asyncio.to_thread(
-                client.retransmit,
-                event_num,
-                heat_num,
-                None,
-            )
+                await asyncio.to_thread(client.retransmit, event_num, heat_num, None)
+                done = await self._wait_for_retransmit_markers_in_live(start_index, read_seconds + 0.5)
 
-            raw = await asyncio.wait_for(
-                self._download_until_end(client, read_seconds),
-                timeout=read_seconds + 0.5,
-            )
+                after = sum(1 for r in self.last_rows if r.row_type == "result")
+                added = max(0, after - before)
 
-            self.on_download_ok(raw)
+                if done:
+                    self.status.showMessage(
+                        f"Live retransmit complete: event {event_num}, heat {heat_num}, +{added} valid rows"
+                    )
+                else:
+                    self.status.showMessage(
+                        f"Live retransmit timed out: event {event_num}, heat {heat_num}, +{added} valid rows"
+                    )
+            else:
+                client = await self._open_client(port, self.selected_baud(), 0.2)
+
+                await asyncio.to_thread(
+                    client.retransmit,
+                    event_num,
+                    heat_num,
+                    None,
+                )
+
+                raw = await asyncio.wait_for(
+                    self._download_until_end(client, read_seconds),
+                    timeout=read_seconds + 0.5,
+                )
+
+                self.on_download_ok(raw)
 
         except asyncio.TimeoutError:
             self.on_download_failed("Download timed out")
         except Exception as e:
             self.on_download_failed(str(e))
         finally:
-            if client is not None:
+            if client is not None and client is not self.live_client:
                 await asyncio.to_thread(client.close)
             self.download_btn.setEnabled(True)
 
@@ -964,25 +1921,35 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
             return
 
-        if self.live_task and not self.live_task.done():
-            QMessageBox.warning(self, "Live Capture Active", "Stop live capture before setting event/heat.")
-            return
-
         event_num = self.event_spin.value()
         heat_num = self.heat_spin.value()
 
         self.status.showMessage(f"Setting event {event_num}, heat {heat_num}...")
 
         client = None
+        using_live_connection = False
         try:
-            client = await self._open_client(port, self.selected_baud(), 0.2)
+            if self._has_live_connection():
+                client = self.live_client
+                using_live_connection = True
+            else:
+                client = await self._open_client(port, self.selected_baud(), 0.2)
+
             await asyncio.to_thread(client.set_event_heat, event_num, heat_num)
-            self.status.showMessage(f"Set event {event_num}, heat {heat_num} command sent")
+
+            self.live_current_event = f"{event_num:03d}"
+            self.live_current_heat = f"{heat_num:02d}"
+
+            if using_live_connection:
+                self.status.showMessage(f"Set event {event_num}, heat {heat_num} command sent on live COM")
+                self.log_timer_command(f"Set E/H on live COM: {event_num:03d}/{heat_num:02d}")
+            else:
+                self.status.showMessage(f"Set event {event_num}, heat {heat_num} command sent")
         except Exception as e:
             QMessageBox.critical(self, "Set Event/Heat Error", str(e))
             self.status.showMessage("Failed to set event/heat")
         finally:
-            if client is not None:
+            if client is not None and not using_live_connection:
                 await asyncio.to_thread(client.close)
 
     @asyncSlot()
@@ -995,6 +1962,10 @@ class MainWindow(QMainWindow):
         if self.live_task and not self.live_task.done():
             return
 
+        if self._has_live_connection():
+            self.status.showMessage("Live connection already open")
+            return
+
         self.live_raw_buffer.clear()
         self.last_raw_bytes = b""
         self.last_rows = []
@@ -1003,6 +1974,10 @@ class MainWindow(QMainWindow):
         self.live_current_heat = ""
         self.live_current_date = ""
         self.live_saw_live_time = False
+        self.live_in_retransmit = False
+        self.live_expect_retransmit_event = False
+        self.live_retransmit_event = ""
+        self.live_retransmit_heat = ""
         self.populate_table([])
         self.update_raw_view()
 
@@ -1011,10 +1986,15 @@ class MainWindow(QMainWindow):
         self.live_start_btn.setEnabled(False)
         self.live_stop_btn.setEnabled(True)
         self.download_btn.setEnabled(False)
+        self._led_on = True
+        self._set_led(True)
+        self._led_timer.start()
 
         client = None
         try:
             client = await self._open_client(port, self.selected_baud(), 0.1)
+            self.live_client = client
+            self.log_timer_command(f"Live COM opened: {port} @ {self.selected_baud()}")
 
             async def runner():
                 try:
@@ -1022,30 +2002,56 @@ class MainWindow(QMainWindow):
                 finally:
                     if client is not None:
                         await asyncio.to_thread(client.close)
+                    self.live_client = None
 
             self.live_task = asyncio.create_task(runner())
         except Exception as e:
             if client is not None:
                 await asyncio.to_thread(client.close)
+            self.live_client = None
+            self.log_timer_command(f"Live COM open failed: {e}")
             self.live_start_btn.setEnabled(True)
             self.live_stop_btn.setEnabled(False)
             self.download_btn.setEnabled(True)
+            self._led_timer.stop()
+            self._set_led(False)
             QMessageBox.critical(self, "Live Capture Error", str(e))
 
     @asyncSlot()
     async def stop_live_capture(self):
+        self.live_stop_btn.setEnabled(False)
+        self.status.showMessage("Stopping live capture...")
+
+        client_to_close = self.live_client
+
         if self.live_task and not self.live_task.done():
             self.live_task.cancel()
             try:
-                await self.live_task
+                await asyncio.wait_for(self.live_task, timeout=1.5)
             except asyncio.CancelledError:
                 pass
+            except asyncio.TimeoutError:
+                # Keep UI responsive even if serial read cancellation is delayed.
+                self.status.showMessage("Live capture stop is taking longer than expected")
+
+        # Always close the COM handle on stop, even if task cancellation was delayed.
+        if client_to_close is not None and client_to_close.ser is not None and client_to_close.ser.is_open:
+            try:
+                await asyncio.to_thread(client_to_close.close)
+            except Exception as e:
+                self.log_timer_command(f"Live COM close warning: {e}")
+
+        self.live_task = None
+        self.live_client = None
+        self.log_timer_command("Live COM closed")
 
         self.append_live_capture_stop_log()
 
         self.live_start_btn.setEnabled(True)
         self.live_stop_btn.setEnabled(False)
         self.download_btn.setEnabled(True)
+        self._led_timer.stop()
+        self._set_led(False)
 
         self.last_raw_bytes = bytes(self.live_raw_buffer)
         cleaned = sanitize_device_bytes(self.last_raw_bytes)
@@ -1059,7 +2065,7 @@ class MainWindow(QMainWindow):
     # Data handlers
     # -----------------------------
     def append_table_row(self, row: ParsedRow):
-        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+        hidden_types = {"live_time", "heat_header", "event_header", "marker", "raw"}
         if row.row_type in hidden_types:
             return
 
@@ -1068,32 +2074,54 @@ class MainWindow(QMainWindow):
         r = self.table.rowCount()
         self.table.insertRow(r)
 
+        group = (row.event, row.heat)
+        if group != self._table_last_group:
+            self._table_bold = not self._table_bold
+            self._table_last_group = group
+
+        event_name = self._lookup_event_name(row.event)
+        meta = self._lookup_event_meta(row.event)
+        gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
+        age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
         values = [
             row.date,
             row.event,
-            row.event_type,
+            event_name or row.event_type,
             row.heat,
             row.lane,
             row.team_name,
             row.bib,
             row.first_name,
             row.last_name,
-            row.gender,
-            row.age_group,
-            row.lap,
+            gender,
+            age_group,
+            row.place,
             row.cumulative_time,
             row.split_time,
         ]
 
         for c, value in enumerate(values):
+            if c == 5:  # Team column - use dropdown
+                combo = self._create_team_combo(r, row.team_name, self._table_bold)
+                self.table.setCellWidget(r, c, combo)
+                continue
+            if c == 6:  # Bib column - use dropdown
+                combo = self._create_bib_combo(r, row.event, row.bib, self._table_bold, row.lane)
+                self.table.setCellWidget(r, c, combo)
+                continue
             item = QTableWidgetItem(value)
             if c in (1, 2, 4):
                 item.setTextAlignment(Qt.AlignCenter)
-            if c == 6:  # Bib column - make editable
-                item.setFlags(item.flags() | Qt.ItemIsEditable)
+            if self._table_bold:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
             self.table.setItem(r, c, item)
 
         self.table.setSortingEnabled(True)
+        self.table.scrollToItem(self.table.item(self.table.rowCount() - 1, 0))
+        self._update_event_heat_banner(self.last_rows)
+        self._write_session_results_csv()
 
     def process_live_chunk_incremental(self, data: bytes):
         sanitized = sanitize_device_bytes(data)
@@ -1112,14 +2140,46 @@ class MainWindow(QMainWindow):
 
 
     def process_live_line(self, line: str):
+        if line.upper().startswith("START OF RETRANSMIT"):
+            self.live_in_retransmit = True
+            self.live_expect_retransmit_event = True
+            self.live_retransmit_event = ""
+            self.live_retransmit_heat = ""
+            return
+
+        if line.upper().startswith("END OF RETRANSMIT"):
+            self.live_in_retransmit = False
+            self.live_expect_retransmit_event = False
+            self.live_retransmit_event = ""
+            self.live_retransmit_heat = ""
+            return
+
+        if self.live_in_retransmit and self.live_expect_retransmit_event:
+            m_event_digits = re.match(r"^(\d{3})$", line)
+            if m_event_digits:
+                self.live_retransmit_event = m_event_digits.group(1)
+                self.live_current_event = self.live_retransmit_event
+                self._sync_event_heat_controls()
+                self.live_expect_retransmit_event = False
+                return
+
         m = HEADER_LT_RE.match(line)
         if m:
             self.live_saw_live_time = True
+            self.last_lt_value = m.group(1)
+            self.lt_seen_counter += 1
+
+            # Device LT updates indicate clock is actively running.
+            if not self.timer_running:
+                self.timer_running = True
+                self._update_timer_button_visual()
+                self.log_timer_command(f"Detected LT from device: {self.last_lt_value} (timer running)")
             return
 
         m = HEADER_EVENT_RE.match(line)
         if m:
             self.live_current_event = m.group(1)
+            self._sync_event_heat_controls()
             return
 
         m = HEADER_DATE_RE.match(line)
@@ -1130,35 +2190,46 @@ class MainWindow(QMainWindow):
         m = HEADER_HEAT_RE.match(line)
         if m:
             self.live_current_heat = m.group(1) or m.group(2)
+            if self.live_in_retransmit:
+                self.live_retransmit_heat = self.live_current_heat
+            self._sync_event_heat_controls()
             return
 
         m = HEADER_HEAT_T_RE.match(line)
         if m:
             self.live_current_heat = m.group(1)
+            if self.live_in_retransmit:
+                self.live_retransmit_heat = self.live_current_heat
+            self._sync_event_heat_controls()
             return
 
         m = HEADER_HEAT_ONLY_RE.match(line)
-        if m and self.live_saw_live_time:
+        if m and (self.live_saw_live_time or self.live_in_retransmit):
             self.live_current_heat = m.group(1)
+            if self.live_in_retransmit:
+                self.live_retransmit_heat = self.live_current_heat
+            self._sync_event_heat_controls()
             return
 
         m = RESULT_RE.match(line)
         if m:
             lane = m.group(1)
-            lap = m.group(2)
+            place = m.group(2)
             cumulative = m.group(3)
             split = m.group(4)
 
             row_date = self.live_current_date or get_local_date_string()
+            row_event = self.live_retransmit_event or self.live_current_event
+            row_heat = self.live_retransmit_heat or self.live_current_heat
 
             row = ParsedRow(
                 "result",
-                self.live_current_event,
-                get_event_type(self.live_current_event),
-                self.live_current_heat,
+                row_event,
+                get_event_type(row_event),
+                row_heat,
                 row_date,
                 lane,
-                lap,
+                place,
                 cumulative,
                 split,
                 line,
@@ -1217,42 +2288,309 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
 
-        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+        hidden_types = {"live_time", "heat_header", "event_header", "marker", "raw"}
+
+        bold = False
+        last_group = None
 
         for row in rows:
             if row.row_type in hidden_types:
                 continue
 
+            group = (row.event, row.heat)
+            if group != last_group:
+                bold = not bold
+                last_group = group
+
             r = self.table.rowCount()
             self.table.insertRow(r)
 
+            event_name = self._lookup_event_name(row.event)
+            meta = self._lookup_event_meta(row.event)
+            gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
+            age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
             values = [
                 row.date,
                 row.event,
-                row.event_type,
+                event_name or row.event_type,
                 row.heat,
                 row.lane,
                 row.team_name,
                 row.bib,
                 row.first_name,
                 row.last_name,
-                row.gender,
-                row.age_group,
-                row.lap,
+                gender,
+                age_group,
+                row.place,
                 row.cumulative_time,
                 row.split_time,
             ]
 
             for c, value in enumerate(values):
+                if c == 5:  # Team column - use dropdown
+                    combo = self._create_team_combo(r, row.team_name, bold)
+                    self.table.setCellWidget(r, c, combo)
+                    continue
+                if c == 6:  # Bib column - use dropdown
+                    combo = self._create_bib_combo(r, row.event, row.bib, bold, row.lane)
+                    self.table.setCellWidget(r, c, combo)
+                    continue
                 item = QTableWidgetItem(value)
                 if c in (1, 2, 4):
                     item.setTextAlignment(Qt.AlignCenter)
-                if c == 6:  # Bib column - make editable
-                    item.setFlags(item.flags() | Qt.ItemIsEditable)
+                if bold:
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
                 self.table.setItem(r, c, item)
 
+        self._table_bold = bold
+        self._table_last_group = last_group
         self.table.setSortingEnabled(True)
         self.table.resizeColumnsToContents()
+        if self.table.rowCount() > 0:
+            self.table.scrollToItem(self.table.item(self.table.rowCount() - 1, 0))
+        self._update_event_heat_banner(rows)
+        self._write_session_results_csv()
+
+    def _lookup_event_name(self, event_code: str) -> str:
+        """Try padded, stripped, and integer-normalised keys against event_name_map."""
+        stripped = event_code.lstrip("0") or event_code
+        for key in (event_code, stripped):
+            name = self.event_name_map.get(key, "")
+            if name:
+                return name
+        # also try zero-padded to 3 digits in case the map has "013" but row has "13"
+        try:
+            padded = str(int(event_code)).zfill(3)
+            name = self.event_name_map.get(padded, "")
+            if name:
+                return name
+        except ValueError:
+            pass
+        return ""
+
+    def _lookup_event_meta(self, event_code: str) -> dict:
+        """Return {'gender': ..., 'age_group': ...} from event_meta_map, trying multiple key forms."""
+        stripped = event_code.lstrip("0") or event_code
+        for key in (event_code, stripped):
+            meta = self.event_meta_map.get(key)
+            if meta:
+                return meta
+        try:
+            padded = str(int(event_code)).zfill(3)
+            meta = self.event_meta_map.get(padded)
+            if meta:
+                return meta
+        except ValueError:
+            pass
+        return {}
+
+    def _get_filtered_bibs(self, event_code: str, lane: str = "") -> List[str]:
+        """Return bib numbers from bib_lookup that match event's gender, age group, and competing teams."""
+        meta = self._lookup_event_meta(event_code)
+        event_gender = meta.get("gender", "")
+        event_age_group = meta.get("age_group", "")
+
+        # Determine allowed teams
+        allowed_teams = set()
+        if self.home_team:
+            allowed_teams.add(self.home_team)
+        for t in self.opponent_teams:
+            allowed_teams.add(t)
+
+        matching = []
+        for bib, info in self.bib_lookup.items():
+            # Team filter
+            if allowed_teams and info.get("team_name", "") not in allowed_teams:
+                continue
+            # Age group must match
+            if event_age_group and info.get("age_group", "") != event_age_group:
+                continue
+            # Gender: match exact, or allow if event is "Male/Female"
+            if event_gender and event_gender != "Male/Female":
+                if info.get("gender", "") != event_gender:
+                    continue
+            matching.append(bib)
+
+        # Sort numerically if possible
+        matching.sort(key=lambda b: (int(b) if b.isdigit() else float('inf'), b))
+        return matching
+
+    def _create_bib_combo(self, table_row: int, event_code: str, current_bib: str, bold: bool, lane: str = "") -> QComboBox:
+        """Create a QComboBox for the bib column filtered by event metadata and teams."""
+        combo = QComboBox()
+        combo.setEditable(True)
+        filtered = self._get_filtered_bibs(event_code, lane)
+
+        # Group bibs: home team first, then opponents
+        home_bibs = []
+        opp_bibs = []
+        for bib in filtered:
+            info = self.bib_lookup.get(bib, {})
+            if info.get("team_name", "") == self.home_team:
+                home_bibs.append(bib)
+            else:
+                opp_bibs.append(bib)
+
+        combo.addItem("")  # blank default
+        if home_bibs:
+            for bib in home_bibs:
+                info = self.bib_lookup.get(bib, {})
+                label = f"{bib} - {info.get('last_name', '')} {info.get('first_name', '')} ({info.get('team_name', '')})"
+                combo.addItem(label, bib)
+        if opp_bibs:
+            combo.insertSeparator(combo.count())
+            for bib in opp_bibs:
+                info = self.bib_lookup.get(bib, {})
+                label = f"{bib} - {info.get('last_name', '')} {info.get('first_name', '')} ({info.get('team_name', '')})"
+                combo.addItem(label, bib)
+
+        # Set current value
+        if current_bib:
+            for i in range(combo.count()):
+                if combo.itemData(i) == current_bib:
+                    combo.setCurrentIndex(i)
+                    break
+            else:
+                combo.setEditText(current_bib)
+
+        if bold:
+            f = combo.font()
+            f.setBold(True)
+            combo.setFont(f)
+
+        combo.setProperty("table_row", table_row)
+        combo.activated.connect(lambda idx, c=combo: self._on_bib_combo_changed(c))
+        combo.lineEdit().editingFinished.connect(lambda c=combo: self._on_bib_combo_changed(c))
+        return combo
+
+    def _create_team_combo(self, table_row: int, current_team: str, bold: bool) -> QComboBox:
+        """Create a QComboBox for the Team column with home + opponent teams."""
+        combo = QComboBox()
+        combo.setEditable(True)
+
+        teams = []
+        if self.home_team:
+            teams.append(self.home_team)
+        for t in self.opponent_teams:
+            if t != self.home_team:
+                teams.append(t)
+
+        combo.addItem("")
+        for t in teams:
+            combo.addItem(t)
+
+        if current_team:
+            idx = combo.findText(current_team)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.setEditText(current_team)
+
+        if bold:
+            f = combo.font()
+            f.setBold(True)
+            combo.setFont(f)
+
+        combo.setProperty("table_row", table_row)
+        combo.activated.connect(lambda idx, c=combo: self._on_team_combo_changed(c))
+        combo.lineEdit().editingFinished.connect(lambda c=combo: self._on_team_combo_changed(c))
+        return combo
+
+    def _on_team_combo_changed(self, combo: QComboBox):
+        """Handle team combo selection."""
+        table_row = combo.property("table_row")
+        team_value = combo.currentText().strip()
+        if not team_value:
+            return
+
+        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+        table_row_index = 0
+
+        for parsed_row in self.last_rows:
+            if parsed_row.row_type in hidden_types:
+                continue
+            if table_row_index == table_row:
+                if parsed_row.row_type != "result":
+                    return
+                parsed_row.team_name = team_value
+                self._write_session_results_csv()
+                self.status.showMessage(f"Set team to {team_value} for row {table_row + 1}")
+                return
+            table_row_index += 1
+
+    def _on_bib_combo_changed(self, combo: QComboBox):
+        """Handle bib combo selection or manual entry."""
+        table_row = combo.property("table_row")
+        bib_value = combo.currentData()
+        if bib_value is None:
+            # Manual text entry
+            bib_value = combo.currentText().strip()
+            # If user typed "123 - Name", extract just the bib
+            if " - " in bib_value:
+                bib_value = bib_value.split(" - ")[0].strip()
+        if not bib_value:
+            return
+
+        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+        table_row_index = 0
+
+        for parsed_row in self.last_rows:
+            if parsed_row.row_type in hidden_types:
+                continue
+
+            if table_row_index == table_row:
+                if parsed_row.row_type != "result":
+                    return
+
+                info = self.bib_lookup.get(bib_value, None)
+                if info is None:
+                    parsed_row.bib = bib_value
+                    parsed_row.team_name = "N/A"
+                    parsed_row.first_name = "N/A"
+                    parsed_row.last_name = "N/A"
+                    parsed_row.gender = "N/A"
+                    parsed_row.age_group = "N/A"
+                else:
+                    parsed_row.bib = bib_value
+                    parsed_row.team_name = info.get("team_name", "N/A")
+                    parsed_row.first_name = info.get("first_name", "N/A")
+                    parsed_row.last_name = info.get("last_name", "N/A")
+                    parsed_row.gender = info.get("gender", "N/A")
+                    parsed_row.age_group = info.get("age_group", "N/A")
+
+                self.table.blockSignals(True)
+                # Update Team combo (column 5 is a cell widget)
+                team_combo = self.table.cellWidget(table_row, 5)
+                if isinstance(team_combo, QComboBox):
+                    idx = team_combo.findText(parsed_row.team_name)
+                    if idx >= 0:
+                        team_combo.setCurrentIndex(idx)
+                    else:
+                        team_combo.setEditText(parsed_row.team_name)
+                self.table.setItem(table_row, 7, QTableWidgetItem(parsed_row.first_name))
+                self.table.setItem(table_row, 8, QTableWidgetItem(parsed_row.last_name))
+                self.table.setItem(table_row, 9, QTableWidgetItem(parsed_row.gender))
+                self.table.setItem(table_row, 10, QTableWidgetItem(parsed_row.age_group))
+                self.table.blockSignals(False)
+                self._write_session_results_csv()
+                self.status.showMessage(f"Assigned bib {bib_value} to row {table_row + 1}")
+                return
+
+            table_row_index += 1
+
+    def _update_event_heat_banner(self, rows: List[ParsedRow]):
+        result_rows = [r for r in rows if r.row_type == "result"]
+        if result_rows:
+            last = result_rows[-1]
+            event_display = last.event.lstrip("0") or last.event
+            heat_display = last.heat.lstrip("0") or last.heat
+            event_name = self._lookup_event_name(last.event)
+            name_part = f" — {event_name}" if event_name else ""
+            self.event_heat_banner.setText(f"Event: {event_display}{name_part}   Heat: {heat_display}")
+        else:
+            self.event_heat_banner.setText("Event: —   Heat: —")
 
     def update_raw_view(self):
         scrollbar = self.raw_text.verticalScrollBar()
@@ -1310,7 +2648,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Table CSV",
-            self.build_csv_default_name(),
+            os.path.join(self.log_session_dir, self.build_csv_default_name()),
             "CSV Files (*.csv)",
         )
         if not path:
@@ -1321,7 +2659,7 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Type", "Event", "Event Type", "Heat", "Date", "Lane", "Team", "Bib", "First Name", "Last Name", "Gender", "Age Group", "Lap", "Cumulative", "Lap Time", "Raw Line"])
+                writer.writerow(["Type", "Event", "Event Type", "Heat", "Date", "Lane", "Team", "Bib", "First Name", "Last Name", "Gender", "Age Group", "Place", "Finish\nTime", "Split Time", "Raw Line"])
                 for row in self.last_rows:
                     if row.row_type in hidden_types:
                         continue
@@ -1338,7 +2676,7 @@ class MainWindow(QMainWindow):
                         row.last_name,
                         row.gender,
                         row.age_group,
-                        row.lap,
+                        row.place,
                         row.cumulative_time,
                         row.split_time,
                         row.raw_line,
@@ -1381,6 +2719,173 @@ class MainWindow(QMainWindow):
             self.bib_csv_label.setText(f"Bib CSV: {os.path.basename(path)}")
             self.status.showMessage(f"Loaded bib map with {len(self.bib_lookup)} entries")
             self.update_bib_dropdown_options()
+            self._populate_team_lists()
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
+
+    def _auto_load_bib_csv(self):
+        default_path = os.path.join("info", "bib_import.csv")
+        if not os.path.isfile(default_path):
+            return
+        try:
+            with open(default_path, "r", newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                fieldnames = {c.strip() for c in reader.fieldnames or []}
+                required = {"Bib", "First Name", "Last Name", "Gender", "Team", "Age Group"}
+                if not required.issubset(fieldnames):
+                    return
+                self.bib_lookup.clear()
+                for r in reader:
+                    bib = r.get("Bib", "").strip()
+                    if not bib:
+                        continue
+                    self.bib_lookup[bib] = {
+                        "team_name": r.get("Team", "").strip() or "N/A",
+                        "first_name": r.get("First Name", "").strip() or "N/A",
+                        "last_name": r.get("Last Name", "").strip() or "N/A",
+                        "gender": r.get("Gender", "").strip() or "N/A",
+                        "age_group": r.get("Age Group", "").strip() or "N/A",
+                    }
+            self.bib_csv_label.setText(f"Bib CSV: {os.path.basename(default_path)} (auto)")
+            self.update_bib_dropdown_options()
+            self._populate_team_lists()
+        except Exception:
+            pass
+
+    def _populate_team_lists(self):
+        """Populate home team combo and opponent list from bib_lookup team names."""
+        teams = sorted({info.get("team_name", "") for info in self.bib_lookup.values() if info.get("team_name", "") and info.get("team_name", "") != "N/A"})
+
+        current_home = self.home_team_combo.currentText()
+        self.home_team_combo.blockSignals(True)
+        self.home_team_combo.clear()
+        for t in teams:
+            self.home_team_combo.addItem(t)
+        idx = self.home_team_combo.findText(current_home)
+        if idx >= 0:
+            self.home_team_combo.setCurrentIndex(idx)
+        else:
+            mo = self.home_team_combo.findText("MountOlive")
+            if mo >= 0:
+                self.home_team_combo.setCurrentIndex(mo)
+        self.home_team = self.home_team_combo.currentText()
+        self.home_team_combo.blockSignals(False)
+
+        prev_selected = set(self.opponent_teams)
+        self.opponent_combo.blockSignals(True)
+        self.opponent_combo.clearItems()
+        for t in teams:
+            if t == self.home_team:
+                continue
+            self.opponent_combo.addCheckItem(t, t in prev_selected)
+        self.opponent_combo.blockSignals(False)
+        self._sync_opponent_selection()
+
+    def _on_home_team_changed(self, text: str):
+        self.home_team = text
+        self._populate_team_lists()
+        if self.last_rows:
+            self.populate_table(self.last_rows)
+
+    def _on_opponents_changed(self):
+        self._sync_opponent_selection()
+        if self.last_rows:
+            self.populate_table(self.last_rows)
+
+    def _sync_opponent_selection(self):
+        self.opponent_teams = self.opponent_combo.checkedItems()
+
+    def _auto_load_events_csv(self):
+        default_path = os.path.join("info", "event_import.csv")
+        if not os.path.isfile(default_path):
+            return
+        try:
+            with open(default_path, "r", newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                fieldnames = {c.strip() for c in reader.fieldnames or []}
+                if not {"event number", "event name"}.issubset(fieldnames):
+                    return
+                self.event_name_map.clear()
+                self.event_meta_map.clear()
+                for r in reader:
+                    event_num = r.get("event number", "").strip()
+                    event_name = r.get("event name", "").strip()
+                    if event_num:
+                        self.event_name_map[event_num] = event_name
+                        self.event_meta_map[event_num] = {
+                            "gender": r.get("gender", "").strip(),
+                            "age_group": r.get("age group", "").strip(),
+                        }
+            self.events_csv_label.setText(f"Events CSV: {os.path.basename(default_path)} (auto)")
+        except Exception:
+            pass
+
+    def show_events_csv_format_help(self):
+        QMessageBox.information(
+            self,
+            "Events CSV Format",
+            "The Events CSV maps event numbers (as reported by the timing device) "
+            "to event names.\n\n"
+            "Required columns:\n"
+            "  \u2022 event number \u2014 the event number (e.g. 1, 7, 13)\n"
+            "  \u2022 event name   \u2014 the name of the event (e.g. 800m, 4x100 relay)\n\n"
+            "Example file contents:\n"
+            "  event number,event name\n"
+            "  1,800m\n"
+            "  7,4x100 relay\n"
+            "  13,100m\n"
+            "  19,400m\n\n"
+            "Column names are case-sensitive.",
+        )
+
+    def load_events_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Events CSV",
+            "",
+            "CSV Files (*.csv);;All Files (*.*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                fieldnames = {c.strip() for c in reader.fieldnames or []}
+                required = {"event number", "event name"}
+                if not required.issubset(fieldnames):
+                    missing = required - fieldnames
+                    QMessageBox.critical(
+                        self,
+                        "Invalid CSV",
+                        f"Missing required column(s): {', '.join(sorted(missing))}\n\n"
+                        f"The CSV must have exactly these column headers:\n"
+                        f"  event number, event name\n\n"
+                        f"Example:\n"
+                        f"  event number,event name\n"
+                        f"  1,800m\n"
+                        f"  7,4x100 relay\n\n"
+                        f"Click the ? button next to 'Upload Events' for full details.",
+                    )
+                    return
+
+                self.event_name_map.clear()
+                self.event_meta_map.clear()
+                for r in reader:
+                    event_num = r.get("event number", "").strip()
+                    event_name = r.get("event name", "").strip()
+                    if event_num:
+                        self.event_name_map[event_num] = event_name
+                        self.event_meta_map[event_num] = {
+                            "gender": r.get("gender", "").strip(),
+                            "age_group": r.get("age group", "").strip(),
+                        }
+
+            self.events_csv_label.setText(f"Events CSV: {os.path.basename(path)}")
+            self.status.showMessage(f"Loaded event map with {len(self.event_name_map)} entries")
+            # Refresh table so existing rows pick up the new event names
+            if self.last_rows:
+                self.populate_table(self.last_rows)
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
 
@@ -1479,6 +2984,7 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, 9, QTableWidgetItem(parsed_row.gender))         # Gender
                 self.table.setItem(row, 10, QTableWidgetItem(parsed_row.age_group))     # Age Group
                 self.table.blockSignals(False)
+                self._write_session_results_csv()
                 return
 
             table_row_index += 1
@@ -1522,9 +3028,68 @@ class MainWindow(QMainWindow):
                 pass
 
     def closeEvent(self, event):
+        self._auto_save_csv()
         loop = asyncio.get_event_loop()
         loop.create_task(self.close_async())
         event.accept()
+
+    def _write_session_results_csv(self):
+        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+        rows = [r for r in self.last_rows if r.row_type not in hidden_types]
+        try:
+            with open(self.session_results_csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Date", "Event", "Event Type", "Heat", "Lane",
+                    "Team", "Bib", "First Name", "Last Name",
+                    "Gender", "Age Group", "Place", "Cumulative", "Split Time",
+                ])
+                for row in rows:
+                    event_name = self._lookup_event_name(row.event)
+                    meta = self._lookup_event_meta(row.event)
+                    gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
+                    age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
+                    writer.writerow([
+                        row.date, row.event, event_name or row.event_type,
+                        row.heat, row.lane, row.team_name, row.bib,
+                        row.first_name, row.last_name, gender, age_group,
+                        row.place, row.cumulative_time, row.split_time,
+                    ])
+        except Exception:
+            pass
+
+    def _auto_save_csv(self):
+        hidden_types = {"live_time", "heat_header", "event_header", "raw"}
+        rows = [r for r in self.last_rows if r.row_type not in hidden_types]
+        if not rows:
+            return
+
+        try:
+            os.makedirs(self.log_session_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = self.build_csv_default_name().replace(".csv", "")
+            path = os.path.join(self.log_session_dir, f"{base}_{ts}.csv")
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Date", "Event", "Event Type", "Heat", "Lane",
+                    "Team", "Bib", "First Name", "Last Name",
+                    "Gender", "Age Group", "Place", "Cumulative", "Split Time",
+                ])
+                for row in rows:
+                    meta = self._lookup_event_meta(row.event)
+                    event_name = self._lookup_event_name(row.event)
+                    gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
+                    age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
+                    writer.writerow([
+                        row.date, row.event, event_name or row.event_type,
+                        row.heat, row.lane, row.team_name, row.bib,
+                        row.first_name, row.last_name, gender, age_group,
+                        row.place, row.cumulative_time, row.split_time,
+                    ])
+        except Exception:
+            pass  # Never block close due to save failure
 
 
 def main():
