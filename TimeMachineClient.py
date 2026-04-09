@@ -1,5 +1,7 @@
 import serial
 import time
+from typing import Optional
+from logging_utils import SessionLogger
 
 
 class TimeMachineClient:
@@ -19,7 +21,12 @@ class TimeMachineClient:
         stopbits: int = serial.STOPBITS_ONE,
         timeout: float = 1.0,
         inter_byte_delay: float = 0.01,
+        logger: Optional[SessionLogger] = None,
     ):
+        self.logger = logger
+        if self.logger:
+            self.logger.info(f"Initializing TimeMachineClient on {port}", component="serial_io")
+        
         self.ser = serial.Serial(
             port=port,
             baudrate=baudrate,
@@ -42,6 +49,8 @@ class TimeMachineClient:
         Send bytes with a small delay between them.
         The old manual suggests command characters may need spacing.
         """
+        if self.logger:
+            self.logger.debug(f"TX: {data.hex()} | {repr(data)}", component="serial_io")
         for b in data:
             self.ser.write(bytes([b]))
             self.ser.flush()

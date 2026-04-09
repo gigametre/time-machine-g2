@@ -1,18 +1,18 @@
 import serial
-import logging
 from datetime import datetime
+from pathlib import Path
 from TimeMachineClient import TimeMachineClient
+from logging_utils import get_session_logger
 
-# Configure logging
-logging.basicConfig(
-    filename=f'com4_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Configure logging using SessionLogger
+session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+session_dir = Path("logs") / f"session_{session_id}"
+session_dir.mkdir(parents=True, exist_ok=True)
+logger = get_session_logger(session_dir)
 
 
 def fetch_event_data(event_num: int = 1):
-    logging.info(f"Starting TimeMachineClient event {event_num} read")
+    logger.info(f"Starting TimeMachineClient event {event_num} read", component="main")
 
     tm = TimeMachineClient(
         port='COM4',
@@ -22,6 +22,7 @@ def fetch_event_data(event_num: int = 1):
         stopbits=serial.STOPBITS_ONE,
         timeout=1.0,
         inter_byte_delay=0.01,
+        logger=logger,
     )
 
     try:
@@ -31,18 +32,18 @@ def fetch_event_data(event_num: int = 1):
         print(f"=== EVENT {event_num} DATA END ===")
 
         logging.info(f"Event {event_num} data received")
-        logging.info(text)
+        logger.log_data("event_data", text, component="main")
 
         return text
 
     except Exception as e:
         print(f"Error reading event {event_num} data: {e}")
-        logging.error(f"Error reading event {event_num} data", exc_info=True)
+        logger.error(f"Error reading event {event_num} data", component="main", exc_info=True)
         return ""
 
     finally:
         tm.close()
-        logging.info("TimeMachineClient closed")
+        logger.info("TimeMachineClient closed", component="main")
 
 
 def main():
@@ -53,6 +54,7 @@ def main():
         parity=serial.PARITY_NONE,
         stopbits=serial.STOPBITS_ONE,
         timeout=1.0,
+        logger=logger,
         inter_byte_delay=0.01,
     )
 

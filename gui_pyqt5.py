@@ -3,6 +3,7 @@ import csv
 import time
 import re
 import os
+import html
 import asyncio
 from datetime import datetime
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QMessageBox,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QPushButton,
     QComboBox,
@@ -49,6 +51,9 @@ from PyQt5.QtWidgets import (
     QToolBar,
     QCheckBox,
     QLineEdit,
+    QScrollArea,
+    QFrame,
+    QLCDNumber,
 )
 
 
@@ -148,11 +153,48 @@ HEADER_HEAT_ONLY_RE = re.compile(r"^(\d{2})$")
 HEADER_HEAT_T_RE = re.compile(r"^T\s*(\d{2})$", re.IGNORECASE)
 HEADER_LT_RE = re.compile(r"^LT\s+(\d{2}:\d{2}:\d{2}\.\d{2})$", re.IGNORECASE)
 HEADER_DATE_RE = re.compile(r"^DATE\s+(.+)$", re.IGNORECASE)
-
+TIMER_COUNT_RE = re.compile(r"^\d{6}$")
 RESULT_RE = re.compile(
     r"^([0-9A-Z]{1,3})\s+(\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{2})\s+(\d{2}:\d{2}\.\d{2})$",
     re.IGNORECASE
 )
+
+def _decode_timer_count(s: str) -> str:
+    """Decode a 6-char timer string (sec_ones, sec_tens, min_ones, min_tens, hr_ones, hr_tens).
+    Example: '923000' -> '03:29'
+    """
+    try:
+        seconds = int(s[1]) * 10 + int(s[0])
+        minutes = int(s[3]) * 10 + int(s[2])
+        hours   = int(s[5]) * 10 + int(s[4])
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+    except (IndexError, ValueError):
+        return ""
+
+
+def _timer_display_to_hhmmss(display: str) -> str:
+    """Convert display format (MM:SS or HH:MM:SS) back to HHMMSS.
+    Example: '03:29' -> '000329', '01:02:45' -> '010245'
+    """
+    try:
+        parts = display.split(":")
+        if len(parts) == 2:  # MM:SS
+            minutes, seconds = int(parts[0]), int(parts[1])
+            hours = 0
+        elif len(parts) == 3:  # HH:MM:SS
+            hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
+        else:
+            return ""
+        
+        # Validate ranges
+        if not (0 <= hours <= 99 and 0 <= minutes <= 59 and 0 <= seconds <= 59):
+            return ""
+        
+        return f"{hours:02d}{minutes:02d}{seconds:02d}"
+    except (ValueError, IndexError):
+        return ""
 
 
 def get_event_type(event_code: str) -> str:
@@ -641,8 +683,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Time Machine Downloader")
         self.resize(1700, 950)
-        self.text_scale = "large"
         self.ui_scale = self._compute_ui_scale()
+        if self.ui_scale >= 1.8:
+            self.text_scale = "xlarge"
+        elif self.ui_scale >= 1.3:
+            self.text_scale = "large"
+        else:
+            self.text_scale = "medium"
 
         self.last_raw_bytes = b""
         self.last_rows: List[ParsedRow] = []
@@ -672,6 +719,10 @@ class MainWindow(QMainWindow):
         self.timer_running = False
         self.lt_seen_counter = 0
         self.last_lt_value = ""
+        self._reset_response_count = 0  # tracks received reset-ack lines (0100000/01000000)
+        self._reset_ack_streak = 0  # consecutive reset-ack count; heat increments once at 2
+        self.live_timer_display = ""  # last decoded timer count from device (e.g. "03:29")
+        self._raw_view_dirty = False  # set when live chunk arrives; cleared by throttled redraw
 
         self.log_session_dir = self.create_log_session_dir()
         self.log_file_path = self.create_session_log_file()
@@ -740,10 +791,14 @@ class MainWindow(QMainWindow):
             return 1.0
 
         geo = screen.availableGeometry()
-        # Scale around a 1920x1080 baseline with conservative clamping.
-        scale_w = geo.width() / 1920.0
-        scale_h = geo.height() / 1080.0
-        return max(0.85, min(1.35, min(scale_w, scale_h)))
+        dpr = screen.devicePixelRatio()
+        # Physical pixels give the real resolution.
+        phys_w = geo.width() * dpr
+        phys_h = geo.height() * dpr
+        # Scale around a 1920x1080 baseline using physical pixels.
+        scale_w = phys_w / 1920.0
+        scale_h = phys_h / 1080.0
+        return max(0.85, min(3.0, min(scale_w, scale_h)))
 
     def _build_ui(self):
         self._build_toolbar()
@@ -759,67 +814,58 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal)
         split.setHandleWidth(6)
         outer.addWidget(split)
+        self.main_splitter = split
 
         # ── Left panel ──────────────────────────────────────────
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
+        left_layout.setSpacing(6)
 
         # --- Connection & Live Capture (combined) ---
         self.conn_group = QGroupBox()
         conn_layout = QVBoxLayout(self.conn_group)
-        conn_layout.setContentsMargins(6, 6, 6, 6)
-        conn_layout.setSpacing(4)
+        conn_layout.setContentsMargins(8, 8, 8, 8)
+        conn_layout.setSpacing(6)
 
         self.port_combo = QComboBox()
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
         self.baud_combo.setCurrentText("9600")
 
-        self.live_led = QLabel()
-        self.live_led.setFixedSize(14, 14)
-        self.live_led.setObjectName("liveLed")
         self._led_on = False
         self._led_timer = QTimer(self)
         self._led_timer.setInterval(500)
         self._led_timer.timeout.connect(self._blink_led)
-        self._set_led(False)
 
-        self.live_start_btn = QPushButton("Start")
+        # Activity indicator (blinks green on data received)
+        self._activity_indicator_on = False
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(100)
+        self._activity_timer.timeout.connect(self._blink_activity_indicator)
+
+        self.live_start_btn = QPushButton("Connect")
         self.live_start_btn.setProperty("kind", "accent")
-        self.live_stop_btn = QPushButton("Stop")
-        self.live_stop_btn.setProperty("kind", "danger")
-        self.live_stop_btn.setEnabled(False)
+        self.live_start_btn.setProperty("compact", True)
 
-        port_row = QHBoxLayout()
-        port_row.setSpacing(6)
-        port_row.addWidget(QLabel("Port"))
-        port_row.addWidget(self.port_combo, 1)
+        conn_grid = QGridLayout()
+        conn_grid.setHorizontalSpacing(8)
+        conn_grid.setVerticalSpacing(6)
+        conn_grid.setColumnStretch(1, 1)
+        lbl_port = QLabel("Port")
+        lbl_port.setObjectName("fieldLabel")
+        lbl_baud = QLabel("Baud")
+        lbl_baud.setObjectName("fieldLabel")
+        conn_grid.addWidget(lbl_port, 0, 0)
+        conn_grid.addWidget(self.port_combo, 0, 1, 1, 2)
+        conn_grid.addWidget(lbl_baud, 1, 0)
+        conn_grid.addWidget(self.baud_combo, 1, 1, 1, 2)
+        conn_layout.addLayout(conn_grid)
 
-        baud_row = QHBoxLayout()
-        baud_row.setSpacing(6)
-        baud_row.addWidget(QLabel("Baud"))
-        baud_row.addWidget(self.baud_combo, 1)
-        live_status_label = QLabel("LIVE")
-        live_status_label.setObjectName("liveLedLabel")
-        baud_row.addWidget(self.live_led)
-        baud_row.addWidget(live_status_label)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-        btn_row.addWidget(self.live_start_btn, 1)
-        btn_row.addWidget(self.live_stop_btn, 1)
-
-        conn_layout.addLayout(port_row)
-        conn_layout.addLayout(baud_row)
-        conn_layout.addLayout(btn_row)
+        conn_layout.addWidget(self.live_start_btn)
 
         # --- Event / Heat / Download ---
         self.dl_group = QGroupBox()
-        dl_grid = QGridLayout(self.dl_group)
-        dl_grid.setHorizontalSpacing(6)
-        dl_grid.setVerticalSpacing(4)
 
         self.event_spin = QSpinBox()
         self.event_spin.setRange(1, 999)
@@ -838,67 +884,66 @@ class MainWindow(QMainWindow):
         self.set_event_heat_btn = QPushButton("Set E/H")
         self.set_event_heat_btn.setProperty("kind", "secondary")
 
-        self.download_btn = QPushButton("Download")
+        self.download_btn = QPushButton("Download E/H")
         self.download_btn.setProperty("kind", "primary")
 
-        compact_field_w = int(72 * self.ui_scale)
-        self.event_spin.setMaximumWidth(compact_field_w)
-        self.heat_spin.setMaximumWidth(compact_field_w)
-        self.read_seconds_spin.setMaximumWidth(int(80 * self.ui_scale))
+        def _field_label(text):
+            lbl = QLabel(text)
+            lbl.setObjectName("fieldLabel")
+            return lbl
 
-        dl_grid.addWidget(QLabel("Event"), 0, 0)
-        dl_grid.addWidget(self.event_spin, 0, 1)
-        dl_grid.addWidget(QLabel("Heat"), 0, 2)
-        dl_grid.addWidget(self.heat_spin, 0, 3)
-        dl_grid.addWidget(QLabel("Timeout"), 1, 0)
-        dl_grid.addWidget(self.read_seconds_spin, 1, 1)
-        dl_grid.addWidget(self.set_event_heat_btn, 1, 2)
-        dl_grid.addWidget(self.download_btn, 1, 3)
+        dl_layout = QVBoxLayout(self.dl_group)
+        dl_layout.setContentsMargins(8, 8, 8, 8)
+        dl_layout.setSpacing(6)
+
+        # Row 1: Event / Heat fields in a grid (timeout moved to Edit menu)
+        fields_grid = QGridLayout()
+        fields_grid.setHorizontalSpacing(8)
+        fields_grid.setVerticalSpacing(4)
+        fields_grid.setColumnStretch(1, 1)
+        fields_grid.setColumnStretch(3, 1)
+        fields_grid.addWidget(_field_label("Event"), 0, 0)
+        fields_grid.addWidget(self.event_spin, 0, 1)
+        fields_grid.addWidget(_field_label("Heat"), 0, 2)
+        fields_grid.addWidget(self.heat_spin, 0, 3)
+        dl_layout.addLayout(fields_grid)
+
+        # Row 2: Action buttons
+        dl_btn_row = QHBoxLayout()
+        dl_btn_row.setSpacing(8)
+        dl_btn_row.addWidget(self.set_event_heat_btn, 1)
+        dl_btn_row.addWidget(self.download_btn, 1)
+        dl_layout.addLayout(dl_btn_row)
 
         # --- Timer Control ---
-        self.timer_group = QGroupBox()
-        timer_grid = QGridLayout(self.timer_group)
-        timer_grid.setHorizontalSpacing(6)
-        timer_grid.setVerticalSpacing(4)
-
+        # Timer controls (buttons) moved to banner; timer log moved to comm_log section
         self.timer_toggle_btn = QPushButton("Start Timer")
         self.timer_toggle_btn.setProperty("kind", "accent")
         self.timer_reset_btn = QPushButton("Reset")
         self.timer_reset_btn.setProperty("kind", "secondary")
+        # Hidden input for timer start time (always defaults to 000000)
         self.timer_start_time_input = QLineEdit("000000")
-        self.timer_start_time_input.setPlaceholderText("HHMMSS")
-        self.timer_start_time_input.setMaxLength(6)
-        self.timer_start_time_input.setMaximumWidth(int(80 * self.ui_scale))
-        self.timer_start_time_input.setAlignment(Qt.AlignCenter)
+        self.timer_start_time_input.setVisible(False)
         self.timer_log_text = QTextEdit()
         self.timer_log_text.setObjectName("timerLogText")
         self.timer_log_text.setReadOnly(True)
-        self.timer_log_text.setMaximumHeight(80)
         self.timer_log_text.setLineWrapMode(QTextEdit.WidgetWidth)
-
-        timer_grid.addWidget(QLabel("Start"), 0, 0)
-        timer_grid.addWidget(self.timer_start_time_input, 0, 1)
-        timer_grid.addWidget(self.timer_toggle_btn, 0, 2)
-        timer_grid.addWidget(self.timer_reset_btn, 0, 3)
-        timer_grid.addWidget(self.timer_log_text, 1, 0, 1, 4)
 
         # --- Bib Lookup ---
         self.bib_group = QGroupBox()
         bib_layout = QVBoxLayout(self.bib_group)
-        bib_layout.setContentsMargins(6, 6, 6, 6)
-        bib_layout.setSpacing(4)
+        bib_layout.setContentsMargins(8, 8, 8, 8)
+        bib_layout.setSpacing(6)
 
-        bib_row = QHBoxLayout()
+        # CSV load buttons — uniform width, stacked with status labels
         self.load_bib_csv_btn = QPushButton("Load Bib CSV")
         self.load_bib_csv_btn.setProperty("kind", "secondary")
         self.bib_csv_label = QLabel("No bib CSV loaded")
         self.bib_csv_label.setObjectName("bibCsvLabel")
-        bib_row.addWidget(self.load_bib_csv_btn)
-        bib_row.addWidget(self.bib_csv_label)
-        bib_row.addStretch()
+        self.bib_csv_label.setWordWrap(True)
+        self.bib_csv_label.setMinimumWidth(0)
 
-        events_row = QHBoxLayout()
-        self.upload_events_btn = QPushButton("Upload Events")
+        self.upload_events_btn = QPushButton("Load Events CSV")
         self.upload_events_btn.setProperty("kind", "secondary")
         self.upload_events_btn.setToolTip(
             "Load a CSV mapping event numbers to event names.\n"
@@ -911,36 +956,59 @@ class MainWindow(QMainWindow):
         self.events_csv_help_btn.setToolTip("Show expected CSV format")
         self.events_csv_label = QLabel("No events CSV loaded")
         self.events_csv_label.setObjectName("eventsCsvLabel")
-        events_row.addWidget(self.upload_events_btn)
-        events_row.addWidget(self.events_csv_help_btn)
-        events_row.addWidget(self.events_csv_label)
-        events_row.addStretch()
+        self.events_csv_label.setWordWrap(True)
+        self.events_csv_label.setMinimumWidth(0)
 
-        bib_layout.addLayout(bib_row)
-        bib_layout.addLayout(events_row)
+        csv_grid = QGridLayout()
+        csv_grid.setHorizontalSpacing(8)
+        csv_grid.setVerticalSpacing(6)
+        csv_grid.setColumnStretch(0, 1)
+        csv_grid.setColumnStretch(1, 0)
+        csv_grid.addWidget(self.load_bib_csv_btn, 0, 0, 1, 2)
+        csv_grid.addWidget(self.bib_csv_label, 1, 0, 1, 2)
 
-        # Home team selector
-        home_row = QHBoxLayout()
-        home_row.setSpacing(6)
+        events_btn_row = QHBoxLayout()
+        events_btn_row.setSpacing(4)
+        events_btn_row.addWidget(self.upload_events_btn, 1)
+        events_btn_row.addWidget(self.events_csv_help_btn, 0)
+        csv_grid.addLayout(events_btn_row, 2, 0, 1, 2)
+        csv_grid.addWidget(self.events_csv_label, 3, 0, 1, 2)
+        bib_layout.addLayout(csv_grid)
+
+        # Separator line
+        csv_sep = QFrame()
+        csv_sep.setFrameShape(QFrame.HLine)
+        csv_sep.setFrameShadow(QFrame.Sunken)
+        csv_sep.setStyleSheet("color: #c0d6dd;")
+        bib_layout.addWidget(csv_sep)
+
+        # Home / Opponents team selectors
+        self.teams_group = QGroupBox()
+        teams_layout = QVBoxLayout(self.teams_group)
+        teams_layout.setContentsMargins(8, 8, 8, 8)
+        teams_layout.setSpacing(6)
+
+        team_grid = QGridLayout()
+        team_grid.setHorizontalSpacing(8)
+        team_grid.setVerticalSpacing(6)
+        team_grid.setColumnStretch(1, 1)
+
         home_lbl = QLabel("Home:")
-        home_lbl.setFixedWidth(60)
+        home_lbl.setObjectName("fieldLabel")
         self.home_team_combo = QComboBox()
         self.home_team_combo.setEditable(True)
         self.home_team_combo.addItem("MountOlive")
         self.home_team_combo.setCurrentText("MountOlive")
-        home_row.addWidget(home_lbl)
-        home_row.addWidget(self.home_team_combo, 1)
-        bib_layout.addLayout(home_row)
+        team_grid.addWidget(home_lbl, 0, 0)
+        team_grid.addWidget(self.home_team_combo, 0, 1)
 
-        # Opponent team selector (checkable dropdown)
-        opp_row = QHBoxLayout()
-        opp_row.setSpacing(6)
         opp_lbl = QLabel("Opponents:")
-        opp_lbl.setFixedWidth(60)
+        opp_lbl.setObjectName("fieldLabel")
         self.opponent_combo = CheckableComboBox()
-        opp_row.addWidget(opp_lbl)
-        opp_row.addWidget(self.opponent_combo, 1)
-        bib_layout.addLayout(opp_row)
+        team_grid.addWidget(opp_lbl, 1, 0)
+        team_grid.addWidget(self.opponent_combo, 1, 1)
+
+        teams_layout.addLayout(team_grid)
 
         self.bib_allowed_label = QLabel("")
         self.bib_allowed_label.setObjectName("bibAgeLabel")
@@ -958,11 +1026,19 @@ class MainWindow(QMainWindow):
 
         compact_mode = self.ui_scale <= 0.95
 
-        left_layout.addWidget(self._make_collapsible_section("Connection & Live", self.conn_group))
+        left_layout.addWidget(self._make_collapsible_section("Connection & Live", self.conn_group, False))
         left_layout.addWidget(self._make_collapsible_section("Event / Heat", self.dl_group))
-        left_layout.addWidget(self._make_collapsible_section("Timer", self.timer_group))
-        left_layout.addWidget(self._make_collapsible_section("Config", self.bib_group, not compact_mode))
+        left_layout.addWidget(self._make_collapsible_section("Teams", self.teams_group, True))
+        left_layout.addWidget(self._make_collapsible_section("Config", self.bib_group, False))
         left_layout.addStretch(1)
+
+        # Wrap left panel in a scroll area so it works on small screens
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setFrameShape(left_scroll.NoFrame)
+        left_scroll.setMinimumWidth(int(260 * self.ui_scale))
+        left_scroll.setWidget(left)
 
         # ── Right panel ─────────────────────────────────────────
         right = QWidget()
@@ -973,33 +1049,119 @@ class MainWindow(QMainWindow):
         right_split = QSplitter(Qt.Vertical)
         right_split.setHandleWidth(6)
 
-        table_group = QGroupBox("Parsed Results")
+        table_group = QGroupBox()
         table_layout = QVBoxLayout(table_group)
+
+        parsed_results_lbl = QLabel("Parsed Results")
+        parsed_results_lbl.setObjectName("sectionTitle")
+        parsed_results_lbl.setAlignment(Qt.AlignLeft)
+        table_layout.addWidget(parsed_results_lbl)
+
+        self.live_banner_indicator = QLabel("Not Connected")
+        self.live_banner_indicator.setObjectName("liveBannerIndicator")
+        self.live_banner_indicator.setFixedWidth(int(100 * self.ui_scale))
+        self.live_banner_indicator.setAlignment(Qt.AlignCenter)
+        self.live_banner_indicator.setStyleSheet(
+            "color: #7a7a7a; font-weight: bold; font-size: 9pt;"
+        )
+
+        self.activity_indicator = QLabel("● Data")
+        self.activity_indicator.setObjectName("activityIndicator")
+        self.activity_indicator.setMinimumWidth(int(68 * self.ui_scale))
+        self.activity_indicator.setAlignment(Qt.AlignCenter)
+        self.activity_indicator.setStyleSheet(
+            "color: #4a7a4a; font-weight: bold; font-size: 12pt;"
+        )
+
+        self.timer_display_banner = QLCDNumber()
+        self.timer_display_banner.setObjectName("timerDisplayBanner")
+        self.timer_display_banner.setDigitCount(8)  # HH:MM:SS
+        self.timer_display_banner.setSegmentStyle(QLCDNumber.Filled)
+        self.timer_display_banner.setMinimumWidth(int(150 * self.ui_scale))
+        self.timer_display_banner.setMinimumHeight(int(32 * self.ui_scale))
+        self.timer_display_banner.display("00:00")
 
         self.event_heat_banner = QLabel("Event: —   Heat: —")
         self.event_heat_banner.setObjectName("eventHeatBanner")
         self.event_heat_banner.setAlignment(Qt.AlignCenter)
+        self.event_heat_banner.setWordWrap(False)
         self.event_heat_banner.setStyleSheet(
             "font-weight: bold; font-size: 13pt; padding: 4px 8px;"
-            "background: palette(midlight); border-radius: 4px;"
+            "background: transparent; border-radius: 4px;"
         )
-        table_layout.addWidget(self.event_heat_banner)
+
+        self.banner_widget = QWidget()
+        self.banner_widget.setObjectName("bannerWidget")
+        self.banner_widget.setStyleSheet(
+            "QWidget#bannerWidget { background: palette(midlight); border-radius: 4px; }"
+        )
+
+        # Segment 1: status lights
+        self.status_cluster = QWidget()
+        self.status_cluster.setObjectName("statusCluster")
+        status_layout = QHBoxLayout(self.status_cluster)
+        status_layout.setContentsMargins(6, 2, 6, 2)
+        status_layout.setSpacing(6)
+        status_layout.addWidget(self.activity_indicator)
+        status_layout.addWidget(self.live_banner_indicator)
+
+        # Segment 2: timer and controls
+        self.timer_cluster = QWidget()
+        self.timer_cluster.setObjectName("timerCluster")
+        timer_layout = QHBoxLayout(self.timer_cluster)
+        timer_layout.setContentsMargins(6, 2, 6, 2)
+        timer_layout.setSpacing(6)
+        timer_layout.addWidget(self.timer_display_banner, 0)
+        timer_layout.addWidget(self.timer_toggle_btn, 0)
+        timer_layout.addWidget(self.timer_reset_btn, 0)
+
+        # Segment 3: event/heat
+        self.event_cluster = QWidget()
+        self.event_cluster.setObjectName("eventCluster")
+        event_layout = QHBoxLayout(self.event_cluster)
+        event_layout.setContentsMargins(8, 2, 8, 2)
+        event_layout.setSpacing(4)
+        event_layout.addWidget(self.event_heat_banner)
+
+        self.banner_divider_1 = QFrame()
+        self.banner_divider_1.setObjectName("bannerDivider")
+        self.banner_divider_1.setFrameShape(QFrame.VLine)
+        self.banner_divider_1.setFrameShadow(QFrame.Plain)
+
+        self.banner_divider_2 = QFrame()
+        self.banner_divider_2.setObjectName("bannerDivider")
+        self.banner_divider_2.setFrameShape(QFrame.VLine)
+        self.banner_divider_2.setFrameShadow(QFrame.Plain)
+
+        self.banner_inner = QGridLayout(self.banner_widget)
+        self.banner_inner.setContentsMargins(4, 2, 4, 2)
+        self.banner_inner.setHorizontalSpacing(8)
+        self.banner_inner.setVerticalSpacing(4)
+        self._banner_compact_mode = None
+        self._update_banner_layout_from_width()
+
+        table_layout.addWidget(self.banner_widget)
 
         self.table = QTableWidget(0, 14)
         self.table.setHorizontalHeaderLabels(
-            ["Date", "Event", "Event \nType", "Heat", "Lane", "Team", "Bib", "First \nName", "Last \nName", "Gender", "Age \nGroup", "Place/\nLap", "Finish\nTime", "Split \nTime"]
+            ["Date", "Event", "Event \nType", "Heat", "Lane", "Bib", "Team", "First \nName", "Last \nName", "Finish\nTime", "Gender", "Age \nGroup", "Place/\nLap", "Split \nTime"]
         )
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table.horizontalHeader().setMinimumSectionSize(50)
+        # Bib/Team get initial widths from _apply_professional_theme(); all columns remain user-adjustable.
         self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed | QTableWidget.AnyKeyPressed)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
-        compact_row_h = max(22, int(24 * self.ui_scale))
+        # Compact row height for Excel-like appearance
+        compact_row_h = max(18, int(20 * self.ui_scale))
         self.table.verticalHeader().setDefaultSectionSize(compact_row_h)
-        self.table.verticalHeader().setMinimumSectionSize(max(20, compact_row_h - 2))
+        self.table.verticalHeader().setMinimumSectionSize(max(16, compact_row_h - 2))
+        # Remove spacing between rows
+        self.table.setShowGrid(True)
+        self.table.setGridStyle(Qt.SolidLine)
         self.table.cellChanged.connect(self.on_table_cell_changed)
         table_layout.addWidget(self.table)
 
@@ -1033,15 +1195,34 @@ class MainWindow(QMainWindow):
         self.raw_text.setLineWrapMode(QTextEdit.NoWrap)
         raw_out_layout.addWidget(self.raw_text)
 
+        # Comm log pane — sits beside Raw Output
+        comm_log_group = QGroupBox()
+        comm_log_layout = QVBoxLayout(comm_log_group)
+        comm_log_layout.setContentsMargins(6, 6, 6, 6)
+        comm_log_layout.setSpacing(4)
+        
+        comm_log_lbl = QLabel("Comm Log")
+        comm_log_lbl.setObjectName("sectionTitle")
+        comm_log_lbl.setAlignment(Qt.AlignLeft)
+        comm_log_layout.addWidget(comm_log_lbl)
+        comm_log_layout.addWidget(self.timer_log_text)
+
+        # Bottom pane: Raw Output | Comm Log side by side
+        bottom_split = QSplitter(Qt.Horizontal)
+        bottom_split.setHandleWidth(6)
+        bottom_split.addWidget(raw_out_group)
+        bottom_split.addWidget(comm_log_group)
+        bottom_split.setSizes([700, 300])
+
         right_split.addWidget(table_group)
-        right_split.addWidget(raw_out_group)
+        right_split.addWidget(bottom_split)
         right_split.setSizes([650, 220])
 
         right_layout.addWidget(right_split)
 
-        split.addWidget(left)
+        split.addWidget(left_scroll)
         split.addWidget(right)
-        split.setSizes([280, 1420])
+        split.setSizes([int(260 * self.ui_scale), 1520])
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
 
@@ -1062,12 +1243,15 @@ class MainWindow(QMainWindow):
 
         self.set_event_heat_btn.clicked.connect(self.set_event_heat_selected)
         self.download_btn.clicked.connect(self.download_selected)
-        self.live_start_btn.clicked.connect(self.start_live_capture)
-        self.live_stop_btn.clicked.connect(self.stop_live_capture)
+        self.live_start_btn.clicked.connect(self._on_connect_toggle)
         self.timer_toggle_btn.clicked.connect(self.on_timer_toggle_clicked)
         self.timer_reset_btn.clicked.connect(self.on_timer_reset_clicked)
 
+        # Reflow banner when splitter sizes change.
+        split.splitterMoved.connect(lambda _pos, _idx: self._update_banner_layout_from_width())
+
         self._apply_professional_theme()
+        self._update_banner_layout_from_width()
 
     def on_live_start_clicked(self):
         self.start_live_capture()
@@ -1081,15 +1265,51 @@ class MainWindow(QMainWindow):
     def on_timer_reset_clicked(self):
         self.reset_timer()
 
+    def _on_connect_toggle(self):
+        """Toggle between starting and stopping live capture."""
+        if self._has_live_connection() or (self.live_task and not self.live_task.done()) or self.live_start_btn.text() == "Disconnect":
+            self.stop_live_capture()
+        else:
+            self.start_live_capture()
+
     def _set_led(self, on: bool):
-        color = "#e03030" if on else "#4a2020"
-        self.live_led.setStyleSheet(
-            f"background: {color}; border: 1px solid #8a3030; border-radius: 8px;"
+        if on:
+            self.live_banner_indicator.setText("● LIVE")
+            self.live_banner_indicator.setStyleSheet(
+                "color: #e03030; font-weight: bold; font-size: 11pt;"
+            )
+        else:
+            self.live_banner_indicator.setText("● LIVE")
+            self.live_banner_indicator.setStyleSheet(
+                "color: #4a2020; font-weight: bold; font-size: 11pt;"
+            )
+
+    def _hide_led(self):
+        self.live_banner_indicator.setText("Not Connected")
+        self.live_banner_indicator.setStyleSheet(
+            "color: #7a7a7a; font-weight: bold; font-size: 9pt;"
         )
 
     def _blink_led(self):
         self._led_on = not self._led_on
         self._set_led(self._led_on)
+
+    def _flash_activity_indicator(self):
+        """Flash the activity indicator green briefly."""
+        self._activity_indicator_on = True
+        self.activity_indicator.setStyleSheet(
+            "color: #2ecc71; font-weight: bold; font-size: 12pt;"
+        )
+        self._activity_timer.stop()
+        self._activity_timer.start()
+
+    def _blink_activity_indicator(self):
+        """Turn off the activity indicator after a brief flash."""
+        self._activity_indicator_on = False
+        self.activity_indicator.setStyleSheet(
+            "color: #4a7a4a; font-weight: bold; font-size: 12pt;"
+        )
+        self._activity_timer.stop()
 
     def _update_timer_button_visual(self):
         if self.timer_running:
@@ -1109,21 +1329,8 @@ class MainWindow(QMainWindow):
         bar.setValue(bar.maximum())
 
     def _build_toolbar(self):
-        toolbar = QToolBar("Main")
-        toolbar.setObjectName("mainToolbar")
-        self.addToolBar(toolbar)
-
-        save_csv_action = QAction("Save Table CSV", self)
-        save_csv_action.triggered.connect(self.save_table_to_csv)
-        toolbar.addAction(save_csv_action)
-
-        save_raw_action = QAction("Save Raw Output", self)
-        save_raw_action.triggered.connect(self.save_raw_output)
-        toolbar.addAction(save_raw_action)
-
-        clear_action = QAction("Clear", self)
-        clear_action.triggered.connect(self.clear_results)
-        toolbar.addAction(clear_action)
+        # Toolbar is kept for spacing/style but actions moved to File menu
+        pass
 
     def _make_collapsible_section(self, title: str, group: QGroupBox, expanded: bool = True) -> QWidget:
         """Wrap a QGroupBox in a collapsible section with a CollapseButton header."""
@@ -1160,8 +1367,71 @@ class MainWindow(QMainWindow):
 
         return section
 
+    def _update_banner_layout_from_width(self):
+        """Dynamically switch banner between wide and compact layouts based on available width."""
+        if not hasattr(self, "banner_inner") or not hasattr(self, "banner_widget"):
+            return
+
+        available_width = self.banner_widget.width() or self.width()
+        compact_mode = available_width < int(980 * self.ui_scale)
+
+        if self._banner_compact_mode == compact_mode:
+            return
+        self._banner_compact_mode = compact_mode
+
+        # Remove all current items from the grid before re-adding in new positions.
+        while self.banner_inner.count():
+            self.banner_inner.takeAt(0)
+
+        # Reset stretches to avoid stale layout behavior.
+        for col in range(6):
+            self.banner_inner.setColumnStretch(col, 0)
+        for row in range(2):
+            self.banner_inner.setRowStretch(row, 0)
+
+        if compact_mode:
+            self.timer_display_banner.setMinimumWidth(int(104 * self.ui_scale))
+            self.banner_divider_2.setVisible(False)
+
+            # Single compact row to keep Event/Heat aligned with status/timer.
+            self.banner_inner.addWidget(self.status_cluster, 0, 0)
+            self.banner_inner.addWidget(self.banner_divider_1, 0, 1)
+            self.banner_inner.addWidget(self.timer_cluster, 0, 2)
+            self.banner_inner.setColumnStretch(3, 1)
+            self.banner_inner.addWidget(self.event_cluster, 0, 4, Qt.AlignRight)
+        else:
+            self.timer_display_banner.setMinimumWidth(int(150 * self.ui_scale))
+            self.banner_divider_2.setVisible(True)
+
+            self.banner_inner.addWidget(self.status_cluster, 0, 0)
+            self.banner_inner.addWidget(self.banner_divider_1, 0, 1)
+            self.banner_inner.addWidget(self.timer_cluster, 0, 2)
+            self.banner_inner.setColumnStretch(3, 1)
+            self.banner_inner.addWidget(self.banner_divider_2, 0, 4)
+            self.banner_inner.addWidget(self.event_cluster, 0, 5)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_banner_layout_from_width()
+
     def _build_menu(self):
         menu = self.menuBar()
+
+        file_menu = menu.addMenu("File")
+        save_csv_action = QAction("Save Table CSV", self)
+        save_csv_action.setShortcut("Ctrl+S")
+        save_csv_action.triggered.connect(self.save_table_to_csv)
+        file_menu.addAction(save_csv_action)
+
+        save_raw_action = QAction("Save Raw Output", self)
+        save_raw_action.triggered.connect(self.save_raw_output)
+        file_menu.addAction(save_raw_action)
+
+        edit_menu = menu.addMenu("Edit")
+        set_timeout_action = QAction("Set Download Timeout...", self)
+        set_timeout_action.triggered.connect(self.set_download_timeout)
+        edit_menu.addAction(set_timeout_action)
+
         view_menu = menu.addMenu("View")
         text_size_menu = view_menu.addMenu("Text Size")
 
@@ -1185,6 +1455,28 @@ class MainWindow(QMainWindow):
             self.text_size_actions[value] = action
 
         self.text_size_actions[self.text_scale].setChecked(True)
+
+        view_menu.addSeparator()
+        clear_action = QAction("Clear Results", self)
+        clear_action.triggered.connect(self.clear_results)
+        view_menu.addAction(clear_action)
+
+    def set_download_timeout(self):
+        current = self.read_seconds_spin.value()
+        value, ok = QInputDialog.getDouble(
+            self,
+            "Set Download Timeout",
+            "Timeout (seconds):",
+            current,
+            0.5,
+            60.0,
+            1,
+        )
+        if not ok:
+            return
+
+        self.read_seconds_spin.setValue(value)
+        self.status.showMessage(f"Download timeout set to {value:.1f}s")
 
     def set_text_scale(self, scale: str):
         if scale not in {"small", "medium", "large", "xlarge"}:
@@ -1261,9 +1553,15 @@ class MainWindow(QMainWindow):
                 else:
                     self.log_timer_command("Sent STOP: 0x80 + 000000 + CR/LF")
             else:
-                start_hhmmss = self.timer_start_time_input.text().strip()
-                if len(start_hhmmss) != 6 or not start_hhmmss.isdigit():
-                    raise ValueError("Start time must be 6 digits in HHMMSS format")
+                # Use the current timer value from the device (live_timer_display)
+                timer_display_used = self.live_timer_display or "0:00"
+                if self.live_timer_display:
+                    start_hhmmss = _timer_display_to_hhmmss(self.live_timer_display)
+                else:
+                    start_hhmmss = "000000"
+
+                if not start_hhmmss:
+                    raise ValueError(f"Invalid timer value from device: '{self.live_timer_display}'. Expected format: MM:SS or HH:MM:SS")
 
                 event_num, heat_num = self.get_current_or_default_event_heat()
                 self.event_spin.setValue(event_num)
@@ -1294,11 +1592,11 @@ class MainWindow(QMainWindow):
                 self.status.showMessage("Timer start confirmed by LT message")
                 if using_live_connection:
                     self.log_timer_command(
-                        f"Set E/H {event_num:03d}/{heat_num:02d}; START on live COM: 0x82 + {encoded} + CR/LF | confirmed LT {self.last_lt_value}"
+                        f"Set E/H {event_num:03d}/{heat_num:02d}; START on live COM using timer {timer_display_used} (0x82 + {encoded} + CR/LF) | confirmed LT {self.last_lt_value}"
                     )
                 else:
                     self.log_timer_command(
-                        f"Set E/H {event_num:03d}/{heat_num:02d}; START: 0x82 + {encoded} + CR/LF | confirmed LT {self.last_lt_value}"
+                        f"Set E/H {event_num:03d}/{heat_num:02d}; START using timer {timer_display_used} (0x82 + {encoded} + CR/LF) | confirmed LT {self.last_lt_value}"
                     )
 
             self._update_timer_button_visual()
@@ -1350,51 +1648,56 @@ class MainWindow(QMainWindow):
             self.timer_reset_btn.setEnabled(True)
 
     def _apply_professional_theme(self):
-        control_h = max(28, int(32 * self.ui_scale))
-        button_h = max(32, int(36 * self.ui_scale))
-        input_padding_v = max(3, int(4 * self.ui_scale))
-        input_padding_h = max(8, int(10 * self.ui_scale))
+        s = self.ui_scale
+        control_h = max(20, int(18 * s))
+        button_h = max(20, int(18 * s))
+        input_padding_v = max(1, int(2 * s))
+        input_padding_h = max(4, int(5 * s))
+
+        # Font sizes scale with ui_scale so high-DPI screens get larger text.
+        def _fs(base: int) -> int:
+            return max(base, int(base * s))
 
         size_map = {
             "small": {
-                "base": 10,
-                "group": 12,
-                "label": 12,
-                "input": 12,
-                "radio": 12,
-                "table": 11,
-                "header": 11,
-                "raw": 13,
+                "base": 8,
+                "group": 9,
+                "label": 9,
+                "input": 9,
+                "radio": 9,
+                "table": 8,
+                "header": 8,
+                "raw": 9,
             },
             "medium": {
-                "base": 11,
-                "group": 13,
-                "label": 13,
-                "input": 13,
-                "radio": 13,
-                "table": 12,
-                "header": 12,
-                "raw": 15,
+                "base": _fs(9),
+                "group": _fs(10),
+                "label": _fs(10),
+                "input": _fs(10),
+                "radio": _fs(10),
+                "table": _fs(9),
+                "header": _fs(9),
+                "raw": _fs(11),
             },
             "large": {
-                "base": 13,
-                "group": 15,
-                "label": 15,
-                "input": 15,
-                "radio": 15,
-                "table": 14,
-                "header": 14,
-                "raw": 18,
+                "base": _fs(13),
+                "group": _fs(15),
+                "label": _fs(15),
+                "input": _fs(15),
+                "radio": _fs(15),
+                "table": _fs(14),
+                "header": _fs(14),
+                "raw": _fs(18),
             },
             "xlarge": {
-                "base": 14,
-                "group": 16,
-                "label": 16,
-                "input": 16,
-                "radio": 16,
-                "table": 15,
-                "header": 15,
-                "raw": 20,
+                "base": _fs(15),
+                "group": _fs(17),
+                "label": _fs(17),
+                "input": _fs(17),
+                "radio": _fs(17),
+                "table": _fs(16),
+                "header": _fs(16),
+                "raw": _fs(21),
             },
         }
         sizes = size_map.get(self.text_scale, size_map["medium"])
@@ -1457,6 +1760,13 @@ class MainWindow(QMainWindow):
                 color: #9c4a2e;
                 font-weight: 700;
                 font-size: {sizes['label']}px;
+            }}
+
+            QLabel#fieldLabel {{
+                color: #0f4f5e;
+                font-weight: 700;
+                font-size: {sizes['label']}px;
+                font-family: "Segoe UI Semibold", "Segoe UI", sans-serif;
             }}
 
             QLabel#bibCsvLabel, QLabel#bibAgeLabel {{
@@ -1543,6 +1853,19 @@ class MainWindow(QMainWindow):
                                             stop:0 #3ba3c3, stop:1 #247892);
             }}
 
+            QPushButton[kind="secondary"] {{
+                color: #1a4f5e;
+                border: 1px solid #8db9c6;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #f0f8fb, stop:1 #dbedf3);
+            }}
+
+            QPushButton[kind="secondary"]:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                            stop:0 #f8fcfe, stop:1 #cde5ed);
+                border: 1px solid #6aa3b4;
+            }}
+
             QPushButton[kind="accent"] {{
                 color: #ffffff;
                 border: 1px solid #1f7c65;
@@ -1590,10 +1913,13 @@ class MainWindow(QMainWindow):
                 selection-color: #102a32;
                 font-size: {sizes['table']}px;
                 padding: 0px;
+                margin: 0px;
             }}
 
             QTableWidget::item {{
                 padding: 0px 2px;
+                margin: 0px;
+                border: 0px;
             }}
 
             QHeaderView::section {{
@@ -1603,7 +1929,7 @@ class MainWindow(QMainWindow):
                 border: 0px;
                 border-right: 1px solid #bcd4dd;
                 border-bottom: 1px solid #bcd4dd;
-                padding: 2px 2px;
+                padding: 1px 2px;
                 font-weight: 700;
                 font-size: {sizes['header']}px;
             }}
@@ -1616,6 +1942,30 @@ class MainWindow(QMainWindow):
                 selection-background-color: #d6edf6;
                 font-family: Consolas, 'Courier New', monospace;
                 font-size: {sizes['raw']}px;
+            }}
+
+            QWidget#statusCluster,
+            QWidget#timerCluster,
+            QWidget#eventCluster {{
+                background: #eef6fa;
+                border: 1px solid #c9dce4;
+                border-radius: 6px;
+            }}
+
+            QFrame#bannerDivider {{
+                color: #b8ccd6;
+                background: #b8ccd6;
+                min-width: 1px;
+                max-width: 1px;
+                margin: 2px 0;
+            }}
+
+            QLCDNumber#timerDisplayBanner {{
+                color: #ff5a45;
+                background: #11161a;
+                border: 1px solid #3a4f5a;
+                border-radius: 4px;
+                padding: 2px;
             }}
 
             QToolBar#mainToolbar {{
@@ -1649,8 +1999,37 @@ class MainWindow(QMainWindow):
         base_font = QFont("Segoe UI", sizes["base"])
         self.setFont(base_font)
 
+        # Set Bib column to exactly 9 characters wide using the actual table font.
+        # Re-apply fixed column widths using the now-correct font metrics.
+        self._bib_col_font_size = sizes["table"]
+        self._apply_fixed_column_widths()
+
     # -----------------------------
     # Port helpers
+    # -----------------------------
+    def _apply_fixed_column_widths(self):
+        """Apply startup widths for all columns, then custom Bib/Team widths.
+        Columns remain user-adjustable because header resize mode is Interactive."""
+        if not hasattr(self, "table"):
+            return
+        from PyQt5.QtGui import QFontMetrics as _QFM
+        font_size = getattr(self, "_bib_col_font_size", 9)
+        table_font = QFont("Segoe UI", font_size)
+        fm = _QFM(table_font)
+
+        # Start every column near the old auto-sized look (header-content based).
+        for col in range(self.table.columnCount()):
+            header_item = self.table.horizontalHeaderItem(col)
+            header_text = header_item.text() if header_item is not None else ""
+            parts = [p.strip() for p in header_text.split("\n")]
+            max_part = max((fm.horizontalAdvance(p) for p in parts if p), default=0)
+            self.table.setColumnWidth(col, max(50, max_part + 18))
+
+        # Keep Bib at 9 characters and Team 25% wider baseline.
+        bib_width = fm.horizontalAdvance("W" * 9) + 16  # 9 chars + padding
+        self.table.setColumnWidth(5, bib_width)
+        self.table.setColumnWidth(6, int(1.25 * max(120, int(102 * self.ui_scale))))
+
     # -----------------------------
     def selected_port(self) -> str:
         val = self.port_combo.currentData()
@@ -1679,15 +2058,22 @@ class MainWindow(QMainWindow):
         if not ports:
             self.port_combo.addItem("No ports found", "")
         else:
+            # Find the first Bluetooth serial port to use as default
+            bt_index = None
+            for i, p in enumerate(ports):
+                if "standard serial over bluetooth" in (p.description or "").lower():
+                    bt_index = i
+                    break
+
             if current:
                 for i in range(self.port_combo.count()):
                     if self.port_combo.itemData(i) == current:
                         self.port_combo.setCurrentIndex(i)
                         break
                 else:
-                    self.port_combo.setCurrentIndex(0)
+                    self.port_combo.setCurrentIndex(bt_index if bt_index is not None else 0)
             else:
-                self.port_combo.setCurrentIndex(0)
+                self.port_combo.setCurrentIndex(bt_index if bt_index is not None else 0)
 
         self.status.showMessage("COM ports refreshed")
 
@@ -1739,6 +2125,12 @@ class MainWindow(QMainWindow):
     def on_event_selection_changed(self, value: int):
         self.update_bib_dropdown_options()
 
+    def _set_heat_italic(self, italic: bool):
+        """Set the heat spinbox font to italic (auto-incremented) or normal (device data)."""
+        f = self.heat_spin.font()
+        f.setItalic(italic)
+        self.heat_spin.setFont(f)
+
     def _sync_event_heat_controls(self):
         if self.live_current_event.isdigit():
             event_num = min(max(int(self.live_current_event), 1), 999)
@@ -1749,6 +2141,38 @@ class MainWindow(QMainWindow):
             heat_num = min(max(int(self.live_current_heat), 1), 99)
             if self.heat_spin.value() != heat_num:
                 self.heat_spin.setValue(heat_num)
+            self._set_heat_italic(False)  # device confirmed the heat — normal style
+
+        self._update_banner_from_live_state()
+
+    def _update_banner_from_live_state(self):
+        """Update the event/heat banner from current live state or spinner values."""
+        event_str = self.live_current_event.lstrip("0") if self.live_current_event else ""
+        heat_str = self.live_current_heat.lstrip("0") if self.live_current_heat else ""
+
+        if not event_str:
+            event_str = str(self.event_spin.value())
+        if not heat_str:
+            heat_str = str(self.heat_spin.value())
+
+        event_raw = self.live_current_event or str(self.event_spin.value())
+        event_name = self._lookup_event_name(event_raw)
+        compact_mode = bool(getattr(self, "_banner_compact_mode", False))
+        name_part = f" — {event_name}" if event_name else ""
+
+        # Update timer display banner (digital clock style)
+        timer_text = self.live_timer_display if self.live_timer_display else "00:00"
+        if len(timer_text) == 4 and ":" in timer_text:
+            timer_text = f"0{timer_text}"
+        self.timer_display_banner.display(timer_text)
+
+        # Update event/heat banner, keeping heat italic in sync with auto-increment state.
+        event_text = html.escape(event_str)
+        name_text = html.escape(name_part)
+        heat_text = html.escape(heat_str)
+        if self.heat_spin.font().italic():
+            heat_text = f"<i>{heat_text}</i>"
+        self.event_heat_banner.setText(f"Event: {event_text}{name_text}   Heat: {heat_text}")
 
     def get_current_or_default_event_heat(self) -> Tuple[int, int]:
         event_text = (self.live_current_event or "").strip()
@@ -1939,6 +2363,7 @@ class MainWindow(QMainWindow):
 
             self.live_current_event = f"{event_num:03d}"
             self.live_current_heat = f"{heat_num:02d}"
+            self._update_banner_from_live_state()
 
             if using_live_connection:
                 self.status.showMessage(f"Set event {event_num}, heat {heat_num} command sent on live COM")
@@ -1968,23 +2393,25 @@ class MainWindow(QMainWindow):
 
         self.live_raw_buffer.clear()
         self.last_raw_bytes = b""
-        self.last_rows = []
         self.live_text_buffer = ""
-        self.live_current_event = ""
-        self.live_current_heat = ""
         self.live_current_date = ""
         self.live_saw_live_time = False
         self.live_in_retransmit = False
         self.live_expect_retransmit_event = False
         self.live_retransmit_event = ""
         self.live_retransmit_heat = ""
-        self.populate_table([])
+        self._reset_response_count = 0
+        self._reset_ack_streak = 0
+        self.live_timer_display = ""
+        self._raw_view_dirty = False
         self.update_raw_view()
 
         self.append_live_capture_start_log()
 
-        self.live_start_btn.setEnabled(False)
-        self.live_stop_btn.setEnabled(True)
+        self.live_start_btn.setText("Disconnect")
+        self.live_start_btn.setProperty("kind", "danger")
+        self.live_start_btn.style().unpolish(self.live_start_btn)
+        self.live_start_btn.style().polish(self.live_start_btn)
         self.download_btn.setEnabled(False)
         self._led_on = True
         self._set_led(True)
@@ -2010,48 +2437,73 @@ class MainWindow(QMainWindow):
                 await asyncio.to_thread(client.close)
             self.live_client = None
             self.log_timer_command(f"Live COM open failed: {e}")
+            self.live_start_btn.setText("Connect")
+            self.live_start_btn.setProperty("kind", "accent")
+            self.live_start_btn.style().unpolish(self.live_start_btn)
+            self.live_start_btn.style().polish(self.live_start_btn)
             self.live_start_btn.setEnabled(True)
-            self.live_stop_btn.setEnabled(False)
             self.download_btn.setEnabled(True)
             self._led_timer.stop()
-            self._set_led(False)
-            QMessageBox.critical(self, "Live Capture Error", str(e))
+            self._hide_led()
+            err_str = str(e)
+            if "semaphore" in err_str.lower() or "errno 121" in err_str.lower() or "oserror(22" in err_str.lower():
+                QMessageBox.critical(
+                    self,
+                    "Time Machine Not Powered On",
+                    "Could not connect to the Time Machine G2.\n\n"
+                    "The device does not appear to be powered on.\n"
+                    "Please turn on the Time Machine G2 and try again.",
+                )
+            else:
+                QMessageBox.critical(self, "Live Capture Error", err_str)
 
     @asyncSlot()
     async def stop_live_capture(self):
-        self.live_stop_btn.setEnabled(False)
+        self.live_start_btn.setEnabled(False)
         self.status.showMessage("Stopping live capture...")
 
         client_to_close = self.live_client
 
-        if self.live_task and not self.live_task.done():
-            self.live_task.cancel()
-            try:
-                await asyncio.wait_for(self.live_task, timeout=1.5)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                # Keep UI responsive even if serial read cancellation is delayed.
-                self.status.showMessage("Live capture stop is taking longer than expected")
+        try:
+            if self.live_task and not self.live_task.done():
+                self.live_task.cancel()
+                try:
+                    await asyncio.wait_for(self.live_task, timeout=1.5)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    # Keep UI responsive even if serial read cancellation is delayed.
+                    self.status.showMessage("Live capture stop is taking longer than expected")
+                except Exception as e:
+                    self.log_timer_command(f"Live task cancel warning: {e}")
 
-        # Always close the COM handle on stop, even if task cancellation was delayed.
-        if client_to_close is not None and client_to_close.ser is not None and client_to_close.ser.is_open:
+            # Always close the COM handle on stop, even if task cancellation was delayed.
             try:
-                await asyncio.to_thread(client_to_close.close)
+                if client_to_close is not None:
+                    ser = getattr(client_to_close, "ser", None)
+                    if ser is not None and ser.is_open:
+                        await asyncio.to_thread(client_to_close.close)
             except Exception as e:
                 self.log_timer_command(f"Live COM close warning: {e}")
+        finally:
+            self.live_task = None
+            self.live_client = None
+            self.log_timer_command("Live COM closed")
 
-        self.live_task = None
-        self.live_client = None
-        self.log_timer_command("Live COM closed")
+            self.append_live_capture_stop_log()
 
-        self.append_live_capture_stop_log()
+            self.live_start_btn.setText("Connect")
+            self.live_start_btn.setProperty("kind", "accent")
+            self.live_start_btn.style().unpolish(self.live_start_btn)
+            self.live_start_btn.style().polish(self.live_start_btn)
+            self.live_start_btn.setEnabled(True)
+            self.download_btn.setEnabled(True)
 
-        self.live_start_btn.setEnabled(True)
-        self.live_stop_btn.setEnabled(False)
-        self.download_btn.setEnabled(True)
-        self._led_timer.stop()
-        self._set_led(False)
+            # Ensure all indicators return to idle state.
+            self._led_timer.stop()
+            self._hide_led()
+            self._activity_timer.stop()
+            self._blink_activity_indicator()
 
         self.last_raw_bytes = bytes(self.live_raw_buffer)
         cleaned = sanitize_device_bytes(self.last_raw_bytes)
@@ -2089,24 +2541,24 @@ class MainWindow(QMainWindow):
             event_name or row.event_type,
             row.heat,
             row.lane,
-            row.team_name,
             row.bib,
+            row.team_name,
             row.first_name,
             row.last_name,
+            row.cumulative_time,
             gender,
             age_group,
             row.place,
-            row.cumulative_time,
             row.split_time,
         ]
 
         for c, value in enumerate(values):
-            if c == 5:  # Team column - use dropdown
-                combo = self._create_team_combo(r, row.team_name, self._table_bold)
+            if c == 5:  # Bib column - use dropdown
+                combo = self._create_bib_combo(r, row.event, row.bib, self._table_bold, row.lane)
                 self.table.setCellWidget(r, c, combo)
                 continue
-            if c == 6:  # Bib column - use dropdown
-                combo = self._create_bib_combo(r, row.event, row.bib, self._table_bold, row.lane)
+            if c == 6:  # Team column - use dropdown
+                combo = self._create_team_combo(r, row.team_name, self._table_bold)
                 self.table.setCellWidget(r, c, combo)
                 continue
             item = QTableWidgetItem(value)
@@ -2140,6 +2592,41 @@ class MainWindow(QMainWindow):
 
 
     def process_live_line(self, line: str):
+        # Detect the timer-reset acknowledgement ("0100000" or "01000000").
+        # Heat increments once when 2+ consecutive reset acks arrive; extras are ignored.
+        if re.match(r"^010{5,6}$", line):
+            self._reset_ack_streak += 1
+            if self._reset_ack_streak == 2:
+                # Second consecutive reset ack → increment heat and reset timer display
+                new_heat = min(self.heat_spin.value() + 1, 99)
+                self.heat_spin.setValue(new_heat)
+                self.live_current_heat = f"{new_heat:02d}"
+                self.live_timer_display = "0:00"
+                self.timer_running = False
+                self._set_heat_italic(True)  # predicted increment — italicize until device confirms
+                self._update_timer_button_visual()
+                self._update_banner_from_live_state()
+                self.log_timer_command(f"Consecutive reset ack: heat advanced to {new_heat}")
+            elif self._reset_ack_streak == 1:
+                self.log_timer_command("Reset ack #1: waiting for consecutive second")
+            # 3rd, 4th, etc. consecutive acks are silently ignored
+            return
+
+        # Any non-reset-ack line breaks the consecutive sequence
+        self._reset_ack_streak = 0
+
+        # Detect 6-digit timer count lines (e.g. "923000" = 03:29)
+        if TIMER_COUNT_RE.match(line):
+            decoded = _decode_timer_count(line)
+            if decoded:
+                self.live_timer_display = decoded
+                # If timer is not already marked as running and we're getting timer counts, it's running
+                if not self.timer_running and decoded != "0:00":
+                    self.timer_running = True
+                    self._update_timer_button_visual()
+                self._update_banner_from_live_state()
+            return
+
         if line.upper().startswith("START OF RETRANSMIT"):
             self.live_in_retransmit = True
             self.live_expect_retransmit_event = True
@@ -2175,6 +2662,9 @@ class MainWindow(QMainWindow):
                 self._update_timer_button_visual()
                 self.log_timer_command(f"Detected LT from device: {self.last_lt_value} (timer running)")
             return
+
+        # Flash activity indicator for non-clock data (EVENT, HEAT, DATE, RESULT lines)
+        self._flash_activity_indicator()
 
         m = HEADER_EVENT_RE.match(line)
         if m:
@@ -2279,6 +2769,17 @@ class MainWindow(QMainWindow):
 
         self.append_to_live_capture_log(data)
         self.process_live_chunk_incremental(data)
+
+        # Throttle raw view updates to avoid flicker; the timer fires every 200ms
+        if not self._raw_view_dirty:
+            self._raw_view_dirty = True
+            QTimer.singleShot(200, self._throttled_raw_view_update)
+
+    def _throttled_raw_view_update(self):
+        """Called by a one-shot timer to do a single full raw view redraw."""
+        if not self._raw_view_dirty:
+            return
+        self._raw_view_dirty = False
         self.update_raw_view()
 
     # -----------------------------
@@ -2315,24 +2816,24 @@ class MainWindow(QMainWindow):
                 event_name or row.event_type,
                 row.heat,
                 row.lane,
-                row.team_name,
                 row.bib,
+                row.team_name,
                 row.first_name,
                 row.last_name,
+                row.cumulative_time,
                 gender,
                 age_group,
                 row.place,
-                row.cumulative_time,
                 row.split_time,
             ]
 
             for c, value in enumerate(values):
-                if c == 5:  # Team column - use dropdown
-                    combo = self._create_team_combo(r, row.team_name, bold)
+                if c == 5:  # Bib column - use dropdown
+                    combo = self._create_bib_combo(r, row.event, row.bib, bold, row.lane)
                     self.table.setCellWidget(r, c, combo)
                     continue
-                if c == 6:  # Bib column - use dropdown
-                    combo = self._create_bib_combo(r, row.event, row.bib, bold, row.lane)
+                if c == 6:  # Team column - use dropdown
+                    combo = self._create_team_combo(r, row.team_name, bold)
                     self.table.setCellWidget(r, c, combo)
                     continue
                 item = QTableWidgetItem(value)
@@ -2347,7 +2848,6 @@ class MainWindow(QMainWindow):
         self._table_bold = bold
         self._table_last_group = last_group
         self.table.setSortingEnabled(True)
-        self.table.resizeColumnsToContents()
         if self.table.rowCount() > 0:
             self.table.scrollToItem(self.table.item(self.table.rowCount() - 1, 0))
         self._update_event_heat_banner(rows)
@@ -2392,17 +2892,21 @@ class MainWindow(QMainWindow):
         event_gender = meta.get("gender", "")
         event_age_group = meta.get("age_group", "")
 
+        def _norm_team(name: str) -> str:
+            return (name or "").strip().casefold()
+
         # Determine allowed teams
         allowed_teams = set()
         if self.home_team:
-            allowed_teams.add(self.home_team)
+            allowed_teams.add(_norm_team(self.home_team))
         for t in self.opponent_teams:
-            allowed_teams.add(t)
+            allowed_teams.add(_norm_team(t))
 
         matching = []
         for bib, info in self.bib_lookup.items():
             # Team filter
-            if allowed_teams and info.get("team_name", "") not in allowed_teams:
+            info_team = _norm_team(info.get("team_name", ""))
+            if allowed_teams and info_team not in allowed_teams:
                 continue
             # Age group must match
             if event_age_group and info.get("age_group", "") != event_age_group:
@@ -2421,6 +2925,10 @@ class MainWindow(QMainWindow):
         """Create a QComboBox for the bib column filtered by event metadata and teams."""
         combo = QComboBox()
         combo.setEditable(True)
+        # Keep the combo's own size hint small so it doesn't widen the column;
+        # the dropdown popup can still be wide enough to read full names.
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
+        combo.view().setMinimumWidth(max(260, int(320 * self.ui_scale)))
         filtered = self._get_filtered_bibs(event_code, lane)
 
         # Group bibs: home team first, then opponents
@@ -2451,6 +2959,8 @@ class MainWindow(QMainWindow):
             for i in range(combo.count()):
                 if combo.itemData(i) == current_bib:
                     combo.setCurrentIndex(i)
+                    # Keep the visible field compact: show only the bib after selection.
+                    combo.setEditText(current_bib)
                     break
             else:
                 combo.setEditText(current_bib)
@@ -2533,6 +3043,9 @@ class MainWindow(QMainWindow):
         if not bib_value:
             return
 
+        # Keep the visible text compact in the cell while preserving rich labels in popup.
+        combo.setEditText(str(bib_value))
+
         hidden_types = {"live_time", "heat_header", "event_header", "raw"}
         table_row_index = 0
 
@@ -2562,7 +3075,7 @@ class MainWindow(QMainWindow):
 
                 self.table.blockSignals(True)
                 # Update Team combo (column 5 is a cell widget)
-                team_combo = self.table.cellWidget(table_row, 5)
+                team_combo = self.table.cellWidget(table_row, 6)
                 if isinstance(team_combo, QComboBox):
                     idx = team_combo.findText(parsed_row.team_name)
                     if idx >= 0:
@@ -2571,8 +3084,9 @@ class MainWindow(QMainWindow):
                         team_combo.setEditText(parsed_row.team_name)
                 self.table.setItem(table_row, 7, QTableWidgetItem(parsed_row.first_name))
                 self.table.setItem(table_row, 8, QTableWidgetItem(parsed_row.last_name))
-                self.table.setItem(table_row, 9, QTableWidgetItem(parsed_row.gender))
-                self.table.setItem(table_row, 10, QTableWidgetItem(parsed_row.age_group))
+                self.table.setItem(table_row, 9, QTableWidgetItem(parsed_row.cumulative_time))
+                self.table.setItem(table_row, 10, QTableWidgetItem(parsed_row.gender))
+                self.table.setItem(table_row, 11, QTableWidgetItem(parsed_row.age_group))
                 self.table.blockSignals(False)
                 self._write_session_results_csv()
                 self.status.showMessage(f"Assigned bib {bib_value} to row {table_row + 1}")
@@ -2599,7 +3113,13 @@ class MainWindow(QMainWindow):
         if self.hex_radio.isChecked():
             self.raw_text.setPlainText(raw_bytes_to_hex(self.last_raw_bytes))
         else:
-            self.raw_text.setPlainText(sanitize_device_bytes(self.last_raw_bytes))
+            text = sanitize_device_bytes(self.last_raw_bytes)
+            # Strip 6-digit timer count lines from display to reduce clutter
+            filtered = "\n".join(
+                ln for ln in text.splitlines()
+                if not TIMER_COUNT_RE.match(ln.strip())
+            )
+            self.raw_text.setPlainText(filtered)
 
         if self.live_task and not self.live_task.done():
             scrollbar.setValue(scrollbar.maximum())
@@ -2677,8 +3197,8 @@ class MainWindow(QMainWindow):
                         row.gender,
                         row.age_group,
                         row.place,
-                        row.cumulative_time,
-                        row.split_time,
+                        f'="{row.cumulative_time}"' if row.cumulative_time else "",
+                        f'="{row.split_time}"' if row.split_time else "",
                         row.raw_line,
                     ])
             self.status.showMessage(f"Saved CSV: {path}")
@@ -2717,6 +3237,7 @@ class MainWindow(QMainWindow):
                     }
 
             self.bib_csv_label.setText(f"Bib CSV: {os.path.basename(path)}")
+            self.bib_csv_label.setToolTip(path)
             self.status.showMessage(f"Loaded bib map with {len(self.bib_lookup)} entries")
             self.update_bib_dropdown_options()
             self._populate_team_lists()
@@ -2747,6 +3268,7 @@ class MainWindow(QMainWindow):
                         "age_group": r.get("Age Group", "").strip() or "N/A",
                     }
             self.bib_csv_label.setText(f"Bib CSV: {os.path.basename(default_path)} (auto)")
+            self.bib_csv_label.setToolTip(default_path)
             self.update_bib_dropdown_options()
             self._populate_team_lists()
         except Exception:
@@ -2817,6 +3339,7 @@ class MainWindow(QMainWindow):
                             "age_group": r.get("age group", "").strip(),
                         }
             self.events_csv_label.setText(f"Events CSV: {os.path.basename(default_path)} (auto)")
+            self.events_csv_label.setToolTip(default_path)
         except Exception:
             pass
 
@@ -2882,6 +3405,7 @@ class MainWindow(QMainWindow):
                         }
 
             self.events_csv_label.setText(f"Events CSV: {os.path.basename(path)}")
+            self.events_csv_label.setToolTip(path)
             self.status.showMessage(f"Loaded event map with {len(self.event_name_map)} entries")
             # Refresh table so existing rows pick up the new event names
             if self.last_rows:
@@ -2928,7 +3452,7 @@ class MainWindow(QMainWindow):
 
     def on_table_cell_changed(self, row, column):
         """Handle table cell edits, specifically for bib column auto-population."""
-        if column != 6:  # Bib column index
+        if column != 5:  # Bib column index
             return
 
         item = self.table.item(row, column)
@@ -3042,7 +3566,7 @@ class MainWindow(QMainWindow):
                 writer.writerow([
                     "Date", "Event", "Event Type", "Heat", "Lane",
                     "Team", "Bib", "First Name", "Last Name",
-                    "Gender", "Age Group", "Place", "Cumulative", "Split Time",
+                    "Gender", "Age Group", "Place", "Finish\nTime", "Split Time",
                 ])
                 for row in rows:
                     event_name = self._lookup_event_name(row.event)
@@ -3053,7 +3577,9 @@ class MainWindow(QMainWindow):
                         row.date, row.event, event_name or row.event_type,
                         row.heat, row.lane, row.team_name, row.bib,
                         row.first_name, row.last_name, gender, age_group,
-                        row.place, row.cumulative_time, row.split_time,
+                        row.place,
+                        f'="{row.cumulative_time}"' if row.cumulative_time else "",
+                        f'="{row.split_time}"' if row.split_time else "",
                     ])
         except Exception:
             pass
@@ -3086,7 +3612,9 @@ class MainWindow(QMainWindow):
                         row.date, row.event, event_name or row.event_type,
                         row.heat, row.lane, row.team_name, row.bib,
                         row.first_name, row.last_name, gender, age_group,
-                        row.place, row.cumulative_time, row.split_time,
+                        row.place,
+                        f'="{row.cumulative_time}"' if row.cumulative_time else "",
+                        f'="{row.split_time}"' if row.split_time else "",
                     ])
         except Exception:
             pass  # Never block close due to save failure
