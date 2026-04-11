@@ -1064,6 +1064,13 @@ class MainWindow(QMainWindow):
         self.download_btn = QPushButton("Download E/H")
         self.download_btn.setProperty("kind", "primary")
 
+        self.sync_btn = QPushButton("Sync with Time Machine")
+        self.sync_btn.setProperty("kind", "secondary")
+        self.sync_btn.setToolTip(
+            "Compare live session data against stored device data\n"
+            "for all captured events/heats. Shows mismatches and missing results."
+        )
+
         def _field_label(text):
             lbl = QLabel(text)
             lbl.setObjectName("fieldLabel")
@@ -1091,6 +1098,9 @@ class MainWindow(QMainWindow):
         dl_btn_row.addWidget(self.set_event_heat_btn, 1)
         dl_btn_row.addWidget(self.download_btn, 1)
         dl_layout.addLayout(dl_btn_row)
+
+        # Row 3: Sync button
+        dl_layout.addWidget(self.sync_btn)
 
         # --- Timer Control ---
         # Timer controls (buttons) moved to banner; timer log moved to comm_log section
@@ -1430,6 +1440,7 @@ class MainWindow(QMainWindow):
 
         self.set_event_heat_btn.clicked.connect(self.set_event_heat_selected)
         self.download_btn.clicked.connect(self.download_selected)
+        self.sync_btn.clicked.connect(self.sync_with_device)
         self.live_start_btn.clicked.connect(self._on_connect_toggle)
         self.timer_toggle_btn.clicked.connect(self.on_timer_toggle_clicked)
         self.timer_reset_btn.clicked.connect(self.on_timer_reset_clicked)
@@ -2539,6 +2550,200 @@ class MainWindow(QMainWindow):
             if client is not None and client is not self.live_client:
                 await asyncio.to_thread(client.close)
             self.download_btn.setEnabled(True)
+
+    @asyncSlot()
+    async def sync_with_device(self):
+        """Download all captured event/heat combos from device and compare with live session data."""
+        port = self.selected_port()
+        if not port:
+            QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
+            return
+
+        # Collect unique (event, heat) pairs that have result rows in the session
+        live_results = [r for r in self.last_rows if r.row_type == "result"]
+        if not live_results:
+            QMessageBox.information(self, "Nothing to Sync", "No results captured in the current session yet.")
+            return
+
+        eh_pairs = sorted({(r.event, r.heat) for r in live_results})
+
+        self.sync_btn.setEnabled(False)
+        self.status.showMessage(f"Syncing {len(eh_pairs)} event/heat pair(s) with device...")
+        QApplication.processEvents()
+
+        read_seconds = self.read_seconds_spin.value()
+        comparison_results = []  # list of dicts per event/heat
+        client = None
+        opened_client = False
+
+        try:
+            if self._has_live_connection():
+                client = self.live_client
+            else:
+                client = await self._open_client(port, self.selected_baud(), 0.2)
+                opened_client = True
+
+            for event_str, heat_str in eh_pairs:
+                event_num = int(event_str) if event_str.isdigit() else 0
+                heat_num = int(heat_str) if heat_str.isdigit() else 0
+                if event_num == 0 or heat_num == 0:
+                    continue
+
+                self.status.showMessage(f"Syncing event {event_num} heat {heat_num}...")
+                QApplication.processEvents()
+
+                # Build set of live results for this event/heat keyed by (lane, place)
+                live_for_eh = [
+                    r for r in live_results
+                    if r.event == event_str and r.heat == heat_str
+                ]
+                live_set = {}
+                for r in live_for_eh:
+                    key = (r.lane, r.place)
+                    live_set[key] = r
+
+                # Download from device
+                device_rows = []
+                try:
+                    if client is self.live_client:
+                        # Use a temporary buffer approach: capture raw bytes during retransmit
+                        start_index = len(self.live_raw_buffer)
+                        await asyncio.to_thread(client.retransmit, event_num, heat_num, None)
+                        done = await self._wait_for_retransmit_markers_in_live(start_index, read_seconds + 0.5)
+                        segment = bytes(self.live_raw_buffer[start_index:])
+                        cleaned = sanitize_device_bytes(segment)
+                        device_rows, _ = parse_time_machine_text(cleaned)
+                    else:
+                        await asyncio.to_thread(client.retransmit, event_num, heat_num, None)
+                        raw = await asyncio.wait_for(
+                            self._download_until_end(client, read_seconds),
+                            timeout=read_seconds + 0.5,
+                        )
+                        cleaned = sanitize_device_bytes(raw)
+                        device_rows, _ = parse_time_machine_text(cleaned)
+                except Exception:
+                    comparison_results.append({
+                        "event": event_str, "heat": heat_str,
+                        "status": "error", "detail": "Failed to download from device",
+                        "matches": [], "mismatches": [], "live_only": [], "device_only": [],
+                    })
+                    continue
+
+                device_result_rows = [r for r in device_rows if r.row_type == "result"]
+                device_set = {}
+                for r in device_result_rows:
+                    key = (r.lane, r.place)
+                    device_set[key] = r
+
+                # Compare
+                all_keys = sorted(set(live_set.keys()) | set(device_set.keys()))
+                matches = []
+                mismatches = []
+                live_only = []
+                device_only = []
+
+                for key in all_keys:
+                    in_live = key in live_set
+                    in_device = key in device_set
+
+                    if in_live and in_device:
+                        lr = live_set[key]
+                        dr = device_set[key]
+                        if lr.cumulative_time == dr.cumulative_time and lr.split_time == dr.split_time:
+                            matches.append(key)
+                        else:
+                            mismatches.append({
+                                "lane": key[0], "place": key[1],
+                                "live_time": lr.cumulative_time, "device_time": dr.cumulative_time,
+                                "live_split": lr.split_time, "device_split": dr.split_time,
+                            })
+                    elif in_live:
+                        live_only.append(key)
+                    else:
+                        device_only.append(key)
+
+                if not mismatches and not live_only and not device_only:
+                    status = "ok"
+                elif mismatches:
+                    status = "mismatch"
+                else:
+                    status = "partial"
+
+                comparison_results.append({
+                    "event": event_str, "heat": heat_str,
+                    "status": status,
+                    "matches": matches, "mismatches": mismatches,
+                    "live_only": live_only, "device_only": device_only,
+                })
+
+        except Exception as e:
+            QMessageBox.critical(self, "Sync Error", str(e))
+            return
+        finally:
+            if opened_client and client is not None:
+                await asyncio.to_thread(client.close)
+            self.sync_btn.setEnabled(True)
+
+        self.status.showMessage("Sync complete")
+        self._show_sync_results(comparison_results)
+
+    def _show_sync_results(self, results: list):
+        """Display a dialog summarizing the sync comparison."""
+        lines = []
+        all_ok = True
+
+        for r in results:
+            event_name = self._lookup_event_name(r["event"])
+            header = f"Event {r['event']}"
+            if event_name:
+                header += f" ({event_name})"
+            header += f"  Heat {r['heat']}"
+
+            n_match = len(r["matches"])
+            n_mismatch = len(r["mismatches"])
+            n_live_only = len(r["live_only"])
+            n_device_only = len(r["device_only"])
+
+            if r["status"] == "error":
+                lines.append(f"<b>{header}</b>: <span style='color:#c0392b'>{r['detail']}</span>")
+                all_ok = False
+                continue
+
+            if r["status"] == "ok":
+                lines.append(f"<b>{header}</b>: <span style='color:#27ae60'>All {n_match} result(s) match ✓</span>")
+                continue
+
+            all_ok = False
+            parts = [f"<b>{header}</b>:"]
+            if n_match:
+                parts.append(f"  <span style='color:#27ae60'>{n_match} match(es)</span>")
+            if n_mismatch:
+                parts.append(f"  <span style='color:#c0392b'>{n_mismatch} mismatch(es):</span>")
+                for m in r["mismatches"]:
+                    parts.append(
+                        f"    Lane {m['lane']} Place {m['place']}: "
+                        f"Live {m['live_time']} / Device {m['device_time']}"
+                    )
+            if n_live_only:
+                parts.append(f"  <span style='color:#e67e22'>{n_live_only} in live session only:</span>")
+                for key in r["live_only"]:
+                    parts.append(f"    Lane {key[0]} Place {key[1]}")
+            if n_device_only:
+                parts.append(f"  <span style='color:#2980b9'>{n_device_only} on device only:</span>")
+                for key in r["device_only"]:
+                    parts.append(f"    Lane {key[0]} Place {key[1]}")
+
+            lines.append("<br>".join(parts))
+
+        title = "Sync Results — All Match ✓" if all_ok else "Sync Results — Differences Found"
+        body = "<br><br>".join(lines)
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setIcon(QMessageBox.Information if all_ok else QMessageBox.Warning)
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(body)
+        msg.exec_()
 
     @asyncSlot()
     async def set_event_heat_selected(self):
@@ -3804,7 +4009,7 @@ class MainWindow(QMainWindow):
             with open(self.session_results_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    "Date", "Event", "Event Type", "Heat", "Lane",
+                    "Date", "Time", "Event", "Event Type", "Heat", "Lane",
                     "Team", "Bib", "First Name", "Last Name",
                     "Gender", "Age Group", "Place", "Finish\nTime", "Split Time",
                 ])
@@ -3813,8 +4018,9 @@ class MainWindow(QMainWindow):
                     meta = self._lookup_event_meta(row.event)
                     gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
                     age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
+                    time_val = row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp
                     writer.writerow([
-                        row.date, row.event, event_name or row.event_type,
+                        row.date, time_val, row.event, event_name or row.event_type,
                         row.heat, row.lane, row.team_name, row.bib,
                         row.first_name, row.last_name, gender, age_group,
                         row.place,
@@ -3839,7 +4045,7 @@ class MainWindow(QMainWindow):
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    "Date", "Event", "Event Type", "Heat", "Lane",
+                    "Date", "Time", "Event", "Event Type", "Heat", "Lane",
                     "Team", "Bib", "First Name", "Last Name",
                     "Gender", "Age Group", "Place", "Cumulative", "Split Time",
                 ])
@@ -3848,8 +4054,9 @@ class MainWindow(QMainWindow):
                     event_name = self._lookup_event_name(row.event)
                     gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
                     age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
+                    time_val = row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp
                     writer.writerow([
-                        row.date, row.event, event_name or row.event_type,
+                        row.date, time_val, row.event, event_name or row.event_type,
                         row.heat, row.lane, row.team_name, row.bib,
                         row.first_name, row.last_name, gender, age_group,
                         row.place,
