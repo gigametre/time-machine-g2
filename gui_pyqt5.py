@@ -23,11 +23,8 @@ from pathlib import Path
 from logging_utils import get_session_logger
 
 
-# Configure logging using SessionLogger
-session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-session_dir = Path("logs") / f"session_{session_id}"
-session_dir.mkdir(parents=True, exist_ok=True)
-logger = get_session_logger(session_dir)
+# Deferred: session logger is initialized once the GUI decides which session dir to use.
+logger = None
 
 
 #TODO: consider using qasync and asyncio for better async handling and cancellation support
@@ -779,10 +776,12 @@ class MainWindow(QMainWindow):
     # -----------------------------
     def _init_new_session_dir(self):
         """Create a fresh session directory and set all log paths."""
+        global logger
         self.log_session_dir = self.create_log_session_dir()
         self.log_file_path = self.create_session_log_file()
         self.live_capture_log_path = self.create_live_capture_log_file()
         self.session_results_csv_path = os.path.join(self.log_session_dir, "session_results.csv")
+        logger = get_session_logger(Path(self.log_session_dir))
 
     def create_log_session_dir(self) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -859,6 +858,7 @@ class MainWindow(QMainWindow):
 
     def _restore_session(self, state_path: str):
         """Load a previous session from its session_state.json."""
+        global logger
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
 
@@ -881,6 +881,8 @@ class MainWindow(QMainWindow):
         else:
             # Previous dir is gone — fall back to a new session dir
             self._init_new_session_dir()
+
+        logger = get_session_logger(Path(self.log_session_dir))
 
         # Restore parsed rows
         self.last_rows = [ParsedRow(**d) for d in state.get("last_rows", [])]
@@ -2321,6 +2323,7 @@ class MainWindow(QMainWindow):
         self.bib_allowed_label.setText(f"Allowed age groups: {age_display}")
 
     def on_event_selection_changed(self, value: int):
+        self.heat_spin.setValue(1)
         self.update_bib_dropdown_options()
 
     def _set_heat_italic(self, italic: bool):
