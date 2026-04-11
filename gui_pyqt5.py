@@ -4,10 +4,12 @@ import time
 import re
 import os
 import html
+import json
 import asyncio
 import threading
+import glob
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple
 
 import serial
@@ -748,24 +750,40 @@ class MainWindow(QMainWindow):
         self.live_timer_display = ""  # last decoded timer count from device (e.g. "03:29")
         self._raw_view_dirty = False  # set when live chunk arrives; cleared by throttled redraw
 
-        self.log_session_dir = self.create_log_session_dir()
-        self.log_file_path = self.create_session_log_file()
-        self.live_capture_log_path = self.create_live_capture_log_file()
-        self.session_results_csv_path = os.path.join(self.log_session_dir, "session_results.csv")
+        # Defer session dir creation — may be replaced by a restored session
+        self.log_session_dir = None
+        self.log_file_path = None
+        self.live_capture_log_path = None
+        self.session_results_csv_path = None
 
         self._build_ui()
         self.refresh_ports()
         self._auto_load_events_csv()
         self._auto_load_bib_csv()
-        self.status.showMessage(f"Logging to {self.log_session_dir}")
 
-        # Auto-start live capture after event loop is running.
-        # 800ms delay gives Bluetooth COM ports time to finish initializing.
-        QTimer.singleShot(800, self.start_live_capture)
+        # Check for a recoverable previous session *before* creating a new log dir
+        self._pending_restore = self._find_recoverable_session()
+
+        if self._pending_restore:
+            # Show restore prompt first; it will create or reuse session dir
+            QTimer.singleShot(200, self._prompt_session_restore)
+        else:
+            self._init_new_session_dir()
+            self.status.showMessage(f"Logging to {self.log_session_dir}")
+            # Auto-start live capture after event loop is running.
+            # 800ms delay gives Bluetooth COM ports time to finish initializing.
+            QTimer.singleShot(800, self.start_live_capture)
 
     # -----------------------------
     # Logging
     # -----------------------------
+    def _init_new_session_dir(self):
+        """Create a fresh session directory and set all log paths."""
+        self.log_session_dir = self.create_log_session_dir()
+        self.log_file_path = self.create_session_log_file()
+        self.live_capture_log_path = self.create_live_capture_log_file()
+        self.session_results_csv_path = os.path.join(self.log_session_dir, "session_results.csv")
+
     def create_log_session_dir(self) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_dir = os.path.abspath("logs")
@@ -806,6 +824,138 @@ class MainWindow(QMainWindow):
         baud = self.selected_baud()
         with open(self.live_capture_log_path, "a", encoding="utf-8") as f:
             f.write(f"\n===== LIVE CAPTURE STOPPED | {timestamp} | port={port} | baud={baud} =====\n")
+
+    # -----------------------------
+    # Session save / restore
+    # -----------------------------
+    def _save_session_state(self):
+        """Persist session state to JSON so it can be restored after a crash or close."""
+        state = {
+            "last_rows": [asdict(r) for r in self.last_rows],
+            "live_raw_buffer": self.live_raw_buffer.hex(),
+            "live_current_event": self.live_current_event,
+            "live_current_heat": self.live_current_heat,
+            "live_current_date": self.live_current_date,
+            "live_saw_live_time": self.live_saw_live_time,
+            "event_spin": self.event_spin.value(),
+            "heat_spin": self.heat_spin.value(),
+            "session_dir": self.log_session_dir,
+        }
+        path = os.path.join(self.log_session_dir, "session_state.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception:
+            pass  # Never block close
+
+    @staticmethod
+    def _find_recoverable_session() -> Optional[str]:
+        """Return the path of the most recent session_state.json, or None."""
+        base_dir = os.path.abspath("logs")
+        if not os.path.isdir(base_dir):
+            return None
+        candidates = sorted(glob.glob(os.path.join(base_dir, "session_*", "session_state.json")))
+        return candidates[-1] if candidates else None
+
+    def _restore_session(self, state_path: str):
+        """Load a previous session from its session_state.json."""
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        # Reuse the original session directory (append to its logs)
+        prev_dir = state.get("session_dir", "")
+        if prev_dir and os.path.isdir(prev_dir):
+            self.log_session_dir = prev_dir
+            self.session_results_csv_path = os.path.join(prev_dir, "session_results.csv")
+            # Reuse the existing live-capture log (append mode) rather than creating a new one
+            existing_logs = glob.glob(os.path.join(prev_dir, "time_machine_live_capture_log_*.txt"))
+            if existing_logs:
+                self.live_capture_log_path = sorted(existing_logs)[-1]
+            else:
+                self.live_capture_log_path = self.create_live_capture_log_file()
+            existing_raw = glob.glob(os.path.join(prev_dir, "time_machine_raw_log_*.txt"))
+            if existing_raw:
+                self.log_file_path = sorted(existing_raw)[-1]
+            else:
+                self.log_file_path = self.create_session_log_file()
+        else:
+            # Previous dir is gone — fall back to a new session dir
+            self._init_new_session_dir()
+
+        # Restore parsed rows
+        self.last_rows = [ParsedRow(**d) for d in state.get("last_rows", [])]
+
+        # Restore raw buffer
+        hex_buf = state.get("live_raw_buffer", "")
+        if hex_buf:
+            self.live_raw_buffer = bytearray.fromhex(hex_buf)
+            self.last_raw_bytes = bytes(self.live_raw_buffer)
+
+        # Restore live parsing state
+        self.live_current_event = state.get("live_current_event", "")
+        self.live_current_heat = state.get("live_current_heat", "")
+        self.live_current_date = state.get("live_current_date", "")
+        self.live_saw_live_time = state.get("live_saw_live_time", False)
+
+        # Restore spin boxes
+        self.event_spin.setValue(state.get("event_spin", 1))
+        self.heat_spin.setValue(state.get("heat_spin", 1))
+
+        # Repopulate table and raw view
+        self.populate_table(self.last_rows)
+        self.update_raw_view()
+
+        self.status.showMessage(f"Restored previous session from {os.path.basename(self.log_session_dir)}")
+
+    def _prompt_session_restore(self):
+        """Ask the user whether to resume the previous session or start fresh."""
+        state_path = self._pending_restore
+        self._pending_restore = None
+
+        if not state_path or not os.path.isfile(state_path):
+            self._init_new_session_dir()
+            self.status.showMessage(f"Logging to {self.log_session_dir}")
+            QTimer.singleShot(600, self.start_live_capture)
+            return
+
+        # Extract directory name for the dialog text
+        session_dir = os.path.dirname(state_path)
+        dir_name = os.path.basename(session_dir)
+        # Count result rows for context
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            result_count = sum(1 for r in state.get("last_rows", []) if r.get("row_type") == "result")
+        except Exception:
+            result_count = 0
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Restore Previous Session")
+        msg.setIcon(QMessageBox.Question)
+        msg.setText(
+            f"A previous session was found:\n"
+            f"  {dir_name}\n"
+            f"  ({result_count} result{'s' if result_count != 1 else ''} captured)\n\n"
+            f"Would you like to resume that session or start fresh?"
+        )
+        resume_btn = msg.addButton("Resume Session", QMessageBox.AcceptRole)
+        msg.addButton("Start Fresh", QMessageBox.RejectRole)
+        msg.exec_()
+
+        if msg.clickedButton() == resume_btn:
+            try:
+                self._restore_session(state_path)
+            except Exception as e:
+                QMessageBox.warning(self, "Restore Failed", f"Could not restore session:\n{e}")
+                # Fall back to a new session dir on failure
+                if not self.log_session_dir:
+                    self._init_new_session_dir()
+        else:
+            # User chose Start Fresh — create a new session dir
+            self._init_new_session_dir()
+
+        self.status.showMessage(f"Logging to {self.log_session_dir}")
+        QTimer.singleShot(600, self.start_live_capture)
 
     # -----------------------------
     # UI
@@ -3638,6 +3788,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def closeEvent(self, event):
+        self._save_session_state()
         self._auto_save_csv()
         loop = asyncio.get_event_loop()
         loop.create_task(self.close_async())
