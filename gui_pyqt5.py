@@ -5,6 +5,7 @@ import re
 import os
 import html
 import asyncio
+import threading
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -145,6 +146,7 @@ class ParsedRow:
     last_name: str = "N/A"
     gender: str = "N/A"
     age_group: str = "N/A"
+    timestamp: str = ""
 
 
 HEADER_EVENT_RE = re.compile(r"^EVENT\s+(\d{3})$", re.IGNORECASE)
@@ -480,16 +482,25 @@ class TimeMachineClient:
             dsrdtr=False,
         )
         self.inter_byte_delay = inter_byte_delay
+        self._lock = threading.Lock()
 
     def close(self):
         if self.ser and self.ser.is_open:
             self.ser.close()
 
     def _write_slow(self, data: bytes):
-        for b in data:
-            self.ser.write(bytes([b]))
-            self.ser.flush()
-            time.sleep(self.inter_byte_delay)
+        with self._lock:
+            for b in data:
+                self.ser.write(bytes([b]))
+                self.ser.flush()
+                time.sleep(self.inter_byte_delay)
+
+    def read_available(self) -> bytes:
+        with self._lock:
+            waiting = self.ser.in_waiting
+            if waiting:
+                return self.ser.read(waiting)
+            return b""
 
     def retransmit(self, event_num: int = 0, heat_num: int = 0, start_time: Optional[str] = None):
         if not (0 <= event_num <= 255):
@@ -717,6 +728,7 @@ class MainWindow(QMainWindow):
         self.live_client: Optional[TimeMachineClient] = None
         self.download_task: Optional[asyncio.Task] = None
         self.timer_running = False
+        self._timer_user_stopped = False  # True after explicit stop; suppresses LT auto-detect until next explicit start
         self.lt_seen_counter = 0
         self.last_lt_value = ""
         self._reset_response_count = 0  # tracks received reset-ack lines (0100000/01000000)
@@ -736,7 +748,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"Logging to {self.log_session_dir}")
 
         # Auto-start live capture after event loop is running.
-        QTimer.singleShot(0, self.start_live_capture)
+        # 800ms delay gives Bluetooth COM ports time to finish initializing.
+        QTimer.singleShot(800, self.start_live_capture)
 
     # -----------------------------
     # Logging
@@ -1090,6 +1103,15 @@ class MainWindow(QMainWindow):
             "background: transparent; border-radius: 4px;"
         )
 
+        self.date_banner = QLabel(f"Date: {get_local_date_string()}")
+        self.date_banner.setObjectName("dateBanner")
+        self.date_banner.setAlignment(Qt.AlignCenter)
+        self.date_banner.setWordWrap(False)
+        self.date_banner.setStyleSheet(
+            "font-weight: bold; font-size: 13pt; padding: 4px 8px;"
+            "background: transparent; border-radius: 4px;"
+        )
+
         self.banner_widget = QWidget()
         self.banner_widget.setObjectName("bannerWidget")
         self.banner_widget.setStyleSheet(
@@ -1114,6 +1136,7 @@ class MainWindow(QMainWindow):
         timer_layout.addWidget(self.timer_display_banner, 0)
         timer_layout.addWidget(self.timer_toggle_btn, 0)
         timer_layout.addWidget(self.timer_reset_btn, 0)
+        timer_layout.addWidget(self.date_banner)
 
         # Segment 3: event/heat
         self.event_cluster = QWidget()
@@ -1142,9 +1165,9 @@ class MainWindow(QMainWindow):
 
         table_layout.addWidget(self.banner_widget)
 
-        self.table = QTableWidget(0, 14)
+        self.table = QTableWidget(0, 15)
         self.table.setHorizontalHeaderLabels(
-            ["Date", "Event", "Event \nType", "Heat", "Lane", "Bib", "Team", "First \nName", "Last \nName", "Finish\nTime", "Gender", "Age \nGroup", "Place/\nLap", "Split \nTime"]
+            ["Date", "Time", "Event", "Event \nType", "Heat", "Lane", "Bib", "Team", "First \nName", "Last \nName", "Finish\nTime", "Gender", "Age \nGroup", "Place/\nLap", "Split \nTime"]
         )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(False)
@@ -1547,6 +1570,7 @@ class MainWindow(QMainWindow):
             if self.timer_running:
                 await asyncio.to_thread(client.timer_stop)
                 self.timer_running = False
+                self._timer_user_stopped = True
                 self.status.showMessage("Timer stop command sent (0x80 + 000000 + CR/LF)")
                 if using_live_connection:
                     self.log_timer_command("Sent STOP on live COM: 0x80 + 000000 + CR/LF")
@@ -1589,6 +1613,7 @@ class MainWindow(QMainWindow):
                     return
 
                 self.timer_running = True
+                self._timer_user_stopped = False
                 self.status.showMessage("Timer start confirmed by LT message")
                 if using_live_connection:
                     self.log_timer_command(
@@ -1601,7 +1626,18 @@ class MainWindow(QMainWindow):
 
             self._update_timer_button_visual()
         except Exception as e:
-            QMessageBox.critical(self, "Timer Control Error", str(e))
+            err_str = str(e)
+            if "permissionerror" in err_str.lower() or "access is denied" in err_str.lower():
+                QMessageBox.critical(
+                    self,
+                    "COM Port In Use",
+                    f"Cannot open {port}: access was denied.\n\n"
+                    "The port may still be held from a previous session.\n"
+                    "Please click 'Connect' to establish the live connection first, "
+                    "then use the timer controls.",
+                )
+            else:
+                QMessageBox.critical(self, "Timer Control Error", err_str)
             self.status.showMessage("Failed to send timer start/stop command")
             self.log_timer_command(f"Error (start/stop): {e}")
         finally:
@@ -2174,6 +2210,10 @@ class MainWindow(QMainWindow):
             heat_text = f"<i>{heat_text}</i>"
         self.event_heat_banner.setText(f"Event: {event_text}{name_text}   Heat: {heat_text}")
 
+        # Update date banner — use device date if available, otherwise OS date.
+        display_date = self.live_current_date or get_local_date_string()
+        self.date_banner.setText(f"Date: {display_date}")
+
     def get_current_or_default_event_heat(self) -> Tuple[int, int]:
         event_text = (self.live_current_event or "").strip()
         heat_text = (self.live_current_heat or "").strip()
@@ -2221,10 +2261,7 @@ class MainWindow(QMainWindow):
         )
 
     async def _read_available_once(self, client: TimeMachineClient) -> bytes:
-        waiting = await asyncio.to_thread(lambda: client.ser.in_waiting)
-        if waiting:
-            return await asyncio.to_thread(client.ser.read, waiting)
-        return b""
+        return await asyncio.to_thread(client.read_available)
 
     async def _download_until_end(self, client: TimeMachineClient, timeout_seconds: float) -> bytes:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -2381,7 +2418,10 @@ class MainWindow(QMainWindow):
     async def start_live_capture(self):
         port = self.selected_port()
         if not port:
-            QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
+            # Only show a warning if this was triggered by the user (button click),
+            # not the auto-connect at boot.
+            if self.live_start_btn.text() == "Connect" and self.live_start_btn.isEnabled():
+                QMessageBox.warning(self, "No COM Port", "Please select a COM port.")
             return
 
         if self.live_task and not self.live_task.done():
@@ -2424,12 +2464,34 @@ class MainWindow(QMainWindow):
             self.log_timer_command(f"Live COM opened: {port} @ {self.selected_baud()}")
 
             async def runner():
+                loop_error = None
                 try:
                     await self._live_capture_loop(client)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    loop_error = e
                 finally:
-                    if client is not None:
-                        await asyncio.to_thread(client.close)
+                    try:
+                        if client is not None:
+                            await asyncio.to_thread(client.close)
+                    except Exception:
+                        pass
                     self.live_client = None
+                    # If loop died unexpectedly (not cancelled by stop_live_capture),
+                    # reset the UI so the user knows they need to reconnect.
+                    if self.live_start_btn.text() != "Connect":
+                        err_msg = str(loop_error) if loop_error else "Connection lost"
+                        self.log_timer_command(f"Live connection dropped: {err_msg}")
+                        self.status.showMessage(f"Connection lost: {err_msg}")
+                        self.live_start_btn.setText("Connect")
+                        self.live_start_btn.setProperty("kind", "accent")
+                        self.live_start_btn.style().unpolish(self.live_start_btn)
+                        self.live_start_btn.style().polish(self.live_start_btn)
+                        self.live_start_btn.setEnabled(True)
+                        self.download_btn.setEnabled(True)
+                        self._led_timer.stop()
+                        self._hide_led()
 
             self.live_task = asyncio.create_task(runner())
         except Exception as e:
@@ -2536,7 +2598,8 @@ class MainWindow(QMainWindow):
         gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
         age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
         values = [
-            row.date,
+            get_local_date_string(),
+            row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp,
             row.event,
             event_name or row.event_type,
             row.heat,
@@ -2553,16 +2616,16 @@ class MainWindow(QMainWindow):
         ]
 
         for c, value in enumerate(values):
-            if c == 5:  # Bib column - use dropdown
+            if c == 6:  # Bib column - use dropdown
                 combo = self._create_bib_combo(r, row.event, row.bib, self._table_bold, row.lane)
                 self.table.setCellWidget(r, c, combo)
                 continue
-            if c == 6:  # Team column - use dropdown
+            if c == 7:  # Team column - use dropdown
                 combo = self._create_team_combo(r, row.team_name, self._table_bold)
                 self.table.setCellWidget(r, c, combo)
                 continue
             item = QTableWidgetItem(value)
-            if c in (1, 2, 4):
+            if c in (2, 3, 5):
                 item.setTextAlignment(Qt.AlignCenter)
             if self._table_bold:
                 f = item.font()
@@ -2621,7 +2684,7 @@ class MainWindow(QMainWindow):
             if decoded:
                 self.live_timer_display = decoded
                 # If timer is not already marked as running and we're getting timer counts, it's running
-                if not self.timer_running and decoded != "0:00":
+                if not self.timer_running and decoded != "0:00" and not self._timer_user_stopped:
                     self.timer_running = True
                     self._update_timer_button_visual()
                 self._update_banner_from_live_state()
@@ -2657,7 +2720,7 @@ class MainWindow(QMainWindow):
             self.lt_seen_counter += 1
 
             # Device LT updates indicate clock is actively running.
-            if not self.timer_running:
+            if not self.timer_running and not self._timer_user_stopped:
                 self.timer_running = True
                 self._update_timer_button_visual()
                 self.log_timer_command(f"Detected LT from device: {self.last_lt_value} (timer running)")
@@ -2675,6 +2738,7 @@ class MainWindow(QMainWindow):
         m = HEADER_DATE_RE.match(line)
         if m:
             self.live_current_date = m.group(1).strip()
+            self.date_banner.setText(f"Date: {self.live_current_date}")
             return
 
         m = HEADER_HEAT_RE.match(line)
@@ -2723,6 +2787,7 @@ class MainWindow(QMainWindow):
                 cumulative,
                 split,
                 line,
+                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
             )
 
             self.last_rows.append(row)
@@ -2749,6 +2814,10 @@ class MainWindow(QMainWindow):
         self.last_raw_bytes = raw
         cleaned_text = sanitize_device_bytes(raw)
         rows, meta = parse_time_machine_text(cleaned_text)
+        download_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        for row in rows:
+            if row.row_type == "result":
+                row.timestamp = download_time
         self.last_rows = rows
 
         self.append_to_raw_log(raw)
@@ -2811,7 +2880,8 @@ class MainWindow(QMainWindow):
             gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
             age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
             values = [
-                row.date,
+                get_local_date_string(),
+                row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp,
                 row.event,
                 event_name or row.event_type,
                 row.heat,
@@ -2828,16 +2898,16 @@ class MainWindow(QMainWindow):
             ]
 
             for c, value in enumerate(values):
-                if c == 5:  # Bib column - use dropdown
+                if c == 6:  # Bib column - use dropdown
                     combo = self._create_bib_combo(r, row.event, row.bib, bold, row.lane)
                     self.table.setCellWidget(r, c, combo)
                     continue
-                if c == 6:  # Team column - use dropdown
+                if c == 7:  # Team column - use dropdown
                     combo = self._create_team_combo(r, row.team_name, bold)
                     self.table.setCellWidget(r, c, combo)
                     continue
                 item = QTableWidgetItem(value)
-                if c in (1, 2, 4):
+                if c in (2, 3, 5):
                     item.setTextAlignment(Qt.AlignCenter)
                 if bold:
                     f = item.font()
@@ -3096,6 +3166,9 @@ class MainWindow(QMainWindow):
 
     def _update_event_heat_banner(self, rows: List[ParsedRow]):
         result_rows = [r for r in rows if r.row_type == "result"]
+        date_rows = [r for r in rows if r.row_type == "date"]
+        current_date = date_rows[-1].date if date_rows else self.live_current_date or get_local_date_string()
+        self.date_banner.setText(f"Date: {current_date}")
         if result_rows:
             last = result_rows[-1]
             event_display = last.event.lstrip("0") or last.event
@@ -3179,7 +3252,7 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Type", "Event", "Event Type", "Heat", "Date", "Lane", "Team", "Bib", "First Name", "Last Name", "Gender", "Age Group", "Place", "Finish\nTime", "Split Time", "Raw Line"])
+                writer.writerow(["Type", "Event", "Event Type", "Heat", "Date", "Time", "Lane", "Team", "Bib", "First Name", "Last Name", "Gender", "Age Group", "Place", "Finish\nTime", "Split Time", "Raw Line"])
                 for row in self.last_rows:
                     if row.row_type in hidden_types:
                         continue
@@ -3188,7 +3261,8 @@ class MainWindow(QMainWindow):
                         row.event,
                         row.event_type,
                         row.heat,
-                        row.date,
+                        get_local_date_string(),
+                        row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp,
                         row.lane,
                         row.team_name,
                         row.bib,
