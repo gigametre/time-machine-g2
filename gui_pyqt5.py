@@ -17,6 +17,16 @@ from qasync import QEventLoop, asyncSlot
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QGuiApplication, QStandardItemModel, QStandardItem
 
+from pathlib import Path
+from logging_utils import get_session_logger
+
+
+# Configure logging using SessionLogger
+session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+session_dir = Path("logs") / f"session_{session_id}"
+session_dir.mkdir(parents=True, exist_ok=True)
+logger = get_session_logger(session_dir)
+
 
 #TODO: consider using qasync and asyncio for better async handling and cancellation support
 #TODO: consider adding a "live parsing" mode that incrementally parses and updates the table as data comes in during live capture, rather than waiting until the end
@@ -459,6 +469,7 @@ def parse_time_machine_text(text: str) -> Tuple[List[ParsedRow], dict]:
 # -----------------------------
 # Backend client
 # -----------------------------
+
 class TimeMachineClient:
     def __init__(
         self,
@@ -468,6 +479,7 @@ class TimeMachineClient:
         parity: str = serial.PARITY_NONE,
         stopbits: int = serial.STOPBITS_ONE,
         timeout: float = 0.2,
+        logger=logger,
         inter_byte_delay: float = 0.01,
     ):
         self.ser = serial.Serial(
