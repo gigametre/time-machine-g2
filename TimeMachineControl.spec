@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:\\Users\\mkeyl\\Documents\\programming\\time_machine_control\\gui_pyqt5.py'],
+    ['C:\\Users\\coach\\OneDrive\\Documents\\programs\\time-machine-g2\\gui_pyqt5.py'],
     pathex=[],
     binaries=[],
     datas=[],

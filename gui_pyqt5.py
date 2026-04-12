@@ -4257,7 +4257,7 @@ class MainWindow(QMainWindow):
                     writer.writerow([
                         "Date", "Time", "Event", "Event Type", "Heat", "Lane",
                         "Bib", "Team", "First Name", "Last Name",
-                        "Gender", "Age Group", "Place", "Finish\nTime", "Split Time",
+                        "Finish Time", "Gender", "Age Group", "Place", "Split Time",
                     ])
                     for row in rows:
                         event_name = self._lookup_event_name(row.event)
@@ -4271,9 +4271,10 @@ class MainWindow(QMainWindow):
                         writer.writerow([
                             date_val, self._csv_text_value(time_val), row.event, event_name or row.event_type,
                             row.heat, row.lane, row.bib, row.team_name,
-                            row.first_name, row.last_name, gender, age_group,
-                            row.place,
+                            row.first_name, row.last_name,
                             self._csv_text_value(cum_val),
+                            gender, age_group,
+                            row.place,
                             self._csv_text_value(spl_val),
                         ])
                 break
