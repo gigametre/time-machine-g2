@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import csv
 import time
 import re
@@ -64,12 +64,19 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QFrame,
     QLCDNumber,
+    QMenu,
 )
 
 
 # -----------------------------
 # Utility helpers
 # -----------------------------
+def _app_dir() -> str:
+    """Return the directory where the executable (or script) resides."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 def get_local_date_string() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -97,12 +104,13 @@ def raw_bytes_to_hex(raw: bytes) -> str:
 
 
 CONTROL_KEEP = {0x09, 0x0A, 0x0D}
+CONTROL_NEWLINE = {0x16}  # 0x16 acts as a line separator from the device
 CONTROL_DROP = {
     0x00, 0x01, 0x02, 0x03, 0x04,
     0x05, 0x06, 0x07, 0x08,
     0x0B, 0x0C,
     0x0E, 0x0F,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17,
     0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
     0x7F,
 }
@@ -113,6 +121,8 @@ def sanitize_device_bytes(raw: bytes) -> str:
     for b in raw:
         if b in CONTROL_KEEP:
             cleaned.append(b)
+        elif b in CONTROL_NEWLINE:
+            cleaned.append(0x0A)  # treat as newline
         elif 32 <= b <= 126:
             cleaned.append(b)
         elif b in CONTROL_DROP:
@@ -700,6 +710,14 @@ class CollapseButton(QPushButton):
 # -----------------------------
 # GUI
 # -----------------------------
+class NoScrollComboBox(QComboBox):
+    """ComboBox that ignores scroll wheel unless the popup is open."""
+    def wheelEvent(self, event):
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -746,8 +764,9 @@ class MainWindow(QMainWindow):
         self._reset_ack_streak = 0  # consecutive reset-ack count; heat increments once at 2
         self.live_timer_display = ""  # last decoded timer count from device (e.g. "03:29")
         self._raw_view_dirty = False  # set when live chunk arrives; cleared by throttled redraw
+        self._live_log_line_buffer = ""  # accumulates partial text lines across chunks for filtering
 
-        # Defer session dir creation — may be replaced by a restored session
+        # Defer session dir creation â€” may be replaced by a restored session
         self.log_session_dir = None
         self.log_file_path = None
         self.live_capture_log_path = None
@@ -785,7 +804,7 @@ class MainWindow(QMainWindow):
 
     def create_log_session_dir(self) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_dir = os.path.abspath("logs")
+        base_dir = os.path.join(_app_dir(), "logs")
         session_dir = os.path.join(base_dir, f"session_{timestamp}")
         os.makedirs(session_dir, exist_ok=True)
         return session_dir
@@ -804,16 +823,52 @@ class MainWindow(QMainWindow):
         with open(self.log_file_path, "a", encoding="utf-8") as f:
             f.write(format_bytes_mixed_ascii_hex(raw))
 
+    # Regex to match timer tick text lines: optional [0x82] prefix + 6-8 digits
+    _TIMER_TICK_TEXT_LINE_RE = re.compile(r'^(?:\[0x82\])?\d{6,8}$')
+
+    def _filter_timer_count_lines(self, text: str) -> str:
+        if not text:
+            return ""
+
+        return "\n".join(
+            ln for ln in text.splitlines()
+            if ln.strip() and not TIMER_COUNT_RE.match(ln.strip())
+        )
+
     def append_to_live_capture_log(self, data: bytes):
         if not data:
             return
+        text = format_bytes_mixed_ascii_hex(data)
+        self._live_log_line_buffer += text
+
+        # Split on \n; keep the last incomplete fragment in the buffer.
+        parts = self._live_log_line_buffer.split('\n')
+        self._live_log_line_buffer = parts[-1]  # incomplete tail (empty string if ended with \n)
+        complete_lines = parts[:-1]
+
+        if not complete_lines:
+            return
+
+        # Filter out timer tick lines (same approach as Raw Output)
+        kept = []
+        for line in complete_lines:
+            stripped = line.rstrip('\r').strip()
+            if stripped and self._TIMER_TICK_TEXT_LINE_RE.fullmatch(stripped):
+                continue
+            kept.append(line)
+
+        if not kept:
+            return
+
+        output = '\n'.join(kept) + '\n'
         with open(self.live_capture_log_path, "a", encoding="utf-8") as f:
-            f.write(format_bytes_mixed_ascii_hex(data))
+            f.write(output)
 
     def append_live_capture_start_log(self):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         port = self.selected_port()
         baud = self.selected_baud()
+        self._live_log_line_buffer = ""
         with open(self.live_capture_log_path, "a", encoding="utf-8") as f:
             f.write(f"\n===== LIVE CAPTURE STARTED | {timestamp} | port={port} | baud={baud} =====\n")
 
@@ -822,6 +877,12 @@ class MainWindow(QMainWindow):
         port = self.selected_port()
         baud = self.selected_baud()
         with open(self.live_capture_log_path, "a", encoding="utf-8") as f:
+            # Flush any remaining buffered text
+            if self._live_log_line_buffer:
+                remaining = self._live_log_line_buffer.rstrip('\r').strip()
+                if remaining and not self._TIMER_TICK_TEXT_LINE_RE.fullmatch(remaining):
+                    f.write(self._live_log_line_buffer + '\n')
+                self._live_log_line_buffer = ""
             f.write(f"\n===== LIVE CAPTURE STOPPED | {timestamp} | port={port} | baud={baud} =====\n")
 
     # -----------------------------
@@ -850,7 +911,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _find_recoverable_session() -> Optional[str]:
         """Return the path of the most recent session_state.json, or None."""
-        base_dir = os.path.abspath("logs")
+        base_dir = os.path.join(_app_dir(), "logs")
         if not os.path.isdir(base_dir):
             return None
         candidates = sorted(glob.glob(os.path.join(base_dir, "session_*", "session_state.json")))
@@ -879,7 +940,7 @@ class MainWindow(QMainWindow):
             else:
                 self.log_file_path = self.create_session_log_file()
         else:
-            # Previous dir is gone — fall back to a new session dir
+            # Previous dir is gone â€” fall back to a new session dir
             self._init_new_session_dir()
 
         logger = get_session_logger(Path(self.log_session_dir))
@@ -953,7 +1014,7 @@ class MainWindow(QMainWindow):
                 if not self.log_session_dir:
                     self._init_new_session_dir()
         else:
-            # User chose Start Fresh — create a new session dir
+            # User chose Start Fresh â€” create a new session dir
             self._init_new_session_dir()
 
         self.status.showMessage(f"Logging to {self.log_session_dir}")
@@ -993,7 +1054,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(split)
         self.main_splitter = split
 
-        # ── Left panel ──────────────────────────────────────────
+        # â”€â”€ Left panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -1045,11 +1106,11 @@ class MainWindow(QMainWindow):
         self.dl_group = QGroupBox()
 
         self.event_spin = QSpinBox()
-        self.event_spin.setRange(1, 999)
+        self.event_spin.setRange(0, 999)
         self.event_spin.setValue(1)
 
         self.heat_spin = QSpinBox()
-        self.heat_spin.setRange(1, 99)
+        self.heat_spin.setRange(0, 99)
         self.heat_spin.setValue(1)
 
         self.read_seconds_spin = QDoubleSpinBox()
@@ -1070,6 +1131,11 @@ class MainWindow(QMainWindow):
             "Compare live session data against stored device data\n"
             "for all captured events/heats. Shows mismatches and missing results."
         )
+        self.sync_btn.setVisible(False)
+
+        self.open_session_csv_btn = QPushButton("Open Session CSV")
+        self.open_session_csv_btn.setProperty("kind", "secondary")
+        self.open_session_csv_btn.setToolTip("Open the current session_results.csv file")
 
         def _field_label(text):
             lbl = QLabel(text)
@@ -1102,6 +1168,9 @@ class MainWindow(QMainWindow):
         # Row 3: Sync button
         dl_layout.addWidget(self.sync_btn)
 
+        # Row 4: Open current session CSV
+        dl_layout.addWidget(self.open_session_csv_btn)
+
         # --- Timer Control ---
         # Timer controls (buttons) moved to banner; timer log moved to comm_log section
         self.timer_toggle_btn = QPushButton("Start Timer")
@@ -1122,7 +1191,7 @@ class MainWindow(QMainWindow):
         bib_layout.setContentsMargins(8, 8, 8, 8)
         bib_layout.setSpacing(6)
 
-        # CSV load buttons — uniform width, stacked with status labels
+        # CSV load buttons â€” uniform width, stacked with status labels
         self.load_bib_csv_btn = QPushButton("Load Bib CSV")
         self.load_bib_csv_btn.setProperty("kind", "secondary")
         self.bib_csv_label = QLabel("No bib CSV loaded")
@@ -1227,7 +1296,7 @@ class MainWindow(QMainWindow):
         left_scroll.setMinimumWidth(int(260 * self.ui_scale))
         left_scroll.setWidget(left)
 
-        # ── Right panel ─────────────────────────────────────────
+        # â”€â”€ Right panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -1252,12 +1321,12 @@ class MainWindow(QMainWindow):
             "color: #7a7a7a; font-weight: bold; font-size: 9pt;"
         )
 
-        self.activity_indicator = QLabel("● Data")
+        self.activity_indicator = QLabel("Data")
         self.activity_indicator.setObjectName("activityIndicator")
         self.activity_indicator.setMinimumWidth(int(68 * self.ui_scale))
         self.activity_indicator.setAlignment(Qt.AlignCenter)
         self.activity_indicator.setStyleSheet(
-            "color: #4a7a4a; font-weight: bold; font-size: 12pt;"
+            "color: #a04a4a; font-weight: bold; font-size: 12pt;"
         )
 
         self.timer_display_banner = QLCDNumber()
@@ -1268,7 +1337,7 @@ class MainWindow(QMainWindow):
         self.timer_display_banner.setMinimumHeight(int(32 * self.ui_scale))
         self.timer_display_banner.display("00:00")
 
-        self.event_heat_banner = QLabel("Event: —   Heat: —")
+        self.event_heat_banner = QLabel("Event: \u2014   Heat: \u2014")
         self.event_heat_banner.setObjectName("eventHeatBanner")
         self.event_heat_banner.setAlignment(Qt.AlignCenter)
         self.event_heat_banner.setWordWrap(False)
@@ -1343,12 +1412,23 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(
             ["Date", "Time", "Event", "Event \nType", "Heat", "Lane", "Bib", "Team", "First \nName", "Last \nName", "Finish\nTime", "Gender", "Age \nGroup", "Place/\nLap", "Split \nTime"]
         )
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setSelectionBehavior(QTableWidget.SelectItems)
+        self.table.setDragEnabled(False)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+        self.table.horizontalHeader().setSectionsClickable(True)
+        self.table.horizontalHeader().setSortIndicatorShown(True)
+        # Single click selects column; Ctrl+click on header to sort
+        self.table.horizontalHeader().sectionClicked.connect(self._on_column_header_clicked)
+        self.table.horizontalHeader().installEventFilter(self)
+        self.table.installEventFilter(self)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table.horizontalHeader().setMinimumSectionSize(50)
         # Bib/Team get initial widths from _apply_professional_theme(); all columns remain user-adjustable.
-        self.table.setSortingEnabled(True)
+        self.table.setSortingEnabled(False)  # sorting triggered manually via Ctrl+click on header
         self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed | QTableWidget.AnyKeyPressed)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
@@ -1392,7 +1472,7 @@ class MainWindow(QMainWindow):
         self.raw_text.setLineWrapMode(QTextEdit.NoWrap)
         raw_out_layout.addWidget(self.raw_text)
 
-        # Comm log pane — sits beside Raw Output
+        # Comm log pane â€” sits beside Raw Output
         comm_log_group = QGroupBox()
         comm_log_layout = QVBoxLayout(comm_log_group)
         comm_log_layout.setContentsMargins(6, 6, 6, 6)
@@ -1441,6 +1521,7 @@ class MainWindow(QMainWindow):
         self.set_event_heat_btn.clicked.connect(self.set_event_heat_selected)
         self.download_btn.clicked.connect(self.download_selected)
         self.sync_btn.clicked.connect(self.sync_with_device)
+        self.open_session_csv_btn.clicked.connect(self.open_session_results_csv)
         self.live_start_btn.clicked.connect(self._on_connect_toggle)
         self.timer_toggle_btn.clicked.connect(self.on_timer_toggle_clicked)
         self.timer_reset_btn.clicked.connect(self.on_timer_reset_clicked)
@@ -1463,21 +1544,37 @@ class MainWindow(QMainWindow):
     def on_timer_reset_clicked(self):
         self.reset_timer()
 
-    def _on_connect_toggle(self):
+    def open_session_results_csv(self):
+        path = self.session_results_csv_path
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(
+                self,
+                "Session CSV Not Found",
+                "session_results.csv has not been created yet for this session.",
+            )
+            return
+
+        try:
+            os.startfile(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Open CSV Error", str(e))
+
+    @asyncSlot()
+    async def _on_connect_toggle(self):
         """Toggle between starting and stopping live capture."""
         if self._has_live_connection() or (self.live_task and not self.live_task.done()) or self.live_start_btn.text() == "Disconnect":
-            self.stop_live_capture()
+            await self.stop_live_capture()
         else:
-            self.start_live_capture()
+            await self.start_live_capture()
 
     def _set_led(self, on: bool):
         if on:
-            self.live_banner_indicator.setText("● LIVE")
+            self.live_banner_indicator.setText("\u25CF LIVE")
             self.live_banner_indicator.setStyleSheet(
                 "color: #e03030; font-weight: bold; font-size: 11pt;"
             )
         else:
-            self.live_banner_indicator.setText("● LIVE")
+            self.live_banner_indicator.setText("\u25CF LIVE")
             self.live_banner_indicator.setStyleSheet(
                 "color: #4a2020; font-weight: bold; font-size: 11pt;"
             )
@@ -1492,6 +1589,12 @@ class MainWindow(QMainWindow):
         self._led_on = not self._led_on
         self._set_led(self._led_on)
 
+    def _set_activity_indicator_idle(self):
+        color = "#4a7a4a" if self._has_live_connection() else "#a04a4a"
+        self.activity_indicator.setStyleSheet(
+            f"color: {color}; font-weight: bold; font-size: 12pt;"
+        )
+
     def _flash_activity_indicator(self):
         """Flash the activity indicator green briefly."""
         self._activity_indicator_on = True
@@ -1504,9 +1607,7 @@ class MainWindow(QMainWindow):
     def _blink_activity_indicator(self):
         """Turn off the activity indicator after a brief flash."""
         self._activity_indicator_on = False
-        self.activity_indicator.setStyleSheet(
-            "color: #4a7a4a; font-weight: bold; font-size: 12pt;"
-        )
+        self._set_activity_indicator_idle()
         self._activity_timer.stop()
 
     def _update_timer_button_visual(self):
@@ -1625,6 +1726,13 @@ class MainWindow(QMainWindow):
         save_raw_action.triggered.connect(self.save_raw_output)
         file_menu.addAction(save_raw_action)
 
+        file_menu.addSeparator()
+        self.debug_action = QAction("Debug Mode", self)
+        self.debug_action.setCheckable(True)
+        self.debug_action.setChecked(False)
+        self.debug_action.triggered.connect(self._toggle_debug_mode)
+        file_menu.addAction(self.debug_action)
+
         edit_menu = menu.addMenu("Edit")
         set_timeout_action = QAction("Set Download Timeout...", self)
         set_timeout_action.triggered.connect(self.set_download_timeout)
@@ -1658,6 +1766,9 @@ class MainWindow(QMainWindow):
         clear_action = QAction("Clear Results", self)
         clear_action.triggered.connect(self.clear_results)
         view_menu.addAction(clear_action)
+
+    def _toggle_debug_mode(self, checked: bool):
+        self.sync_btn.setVisible(checked)
 
     def set_download_timeout(self):
         current = self.read_seconds_spin.value()
@@ -2120,8 +2231,8 @@ class MainWindow(QMainWindow):
                 alternate-background-color: #f4fbfe;
                 gridline-color: #d6e5ea;
                 color: #17313a;
-                selection-background-color: #bfe4ef;
-                selection-color: #102a32;
+                selection-background-color: #808080;
+                selection-color: #17313a;
                 font-size: {sizes['table']}px;
                 padding: 0px;
                 margin: 0px;
@@ -2131,6 +2242,11 @@ class MainWindow(QMainWindow):
                 padding: 0px 2px;
                 margin: 0px;
                 border: 0px;
+            }}
+
+            QTableWidget::item:selected {{
+                background-color: #808080;
+                color: #ffffff;
             }}
 
             QHeaderView::section {{
@@ -2264,7 +2380,7 @@ class MainWindow(QMainWindow):
         ports.sort(key=port_sort_key)
 
         for p in ports:
-            self.port_combo.addItem(f"{p.device} — {p.description}", p.device)
+            self.port_combo.addItem(f"{p.device} â€” {p.description}", p.device)
 
         if not ports:
             self.port_combo.addItem("No ports found", "")
@@ -2337,6 +2453,80 @@ class MainWindow(QMainWindow):
         self.heat_spin.setValue(1)
         self.update_bib_dropdown_options()
 
+    def _on_column_header_clicked(self, col: int):
+        """Ctrl+click sorts the column; plain click selects the whole column."""
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.ControlModifier:
+            # Ctrl+click: toggle sort on this column
+            header = self.table.horizontalHeader()
+            current_col = header.sortIndicatorSection()
+            current_order = header.sortIndicatorOrder()
+            if current_col == col and current_order == Qt.AscendingOrder:
+                order = Qt.DescendingOrder
+            else:
+                order = Qt.AscendingOrder
+            self.table.setSortingEnabled(True)
+            self.table.sortItems(col, order)
+            self.table.setSortingEnabled(False)
+        else:
+            # Plain click: select entire column
+            self.table.clearSelection()
+            sel_model = self.table.selectionModel()
+            for row in range(self.table.rowCount()):
+                idx = self.table.model().index(row, col)
+                sel_model.select(idx, sel_model.Select)
+
+    def _on_table_context_menu(self, pos):
+        """Show right-click context menu on the table."""
+        menu = QMenu(self.table)
+        copy_action = menu.addAction("Copy")
+        copy_action.setShortcut("Ctrl+C")
+        action = menu.exec_(self.table.viewport().mapToGlobal(pos))
+        if action == copy_action:
+            self._copy_table_selection()
+
+    def eventFilter(self, source, event):
+        """Handle Ctrl+C on the results table."""
+        from PyQt5.QtCore import QEvent
+        if source is self.table and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+                self._copy_table_selection()
+                return True
+        return super().eventFilter(source, event)
+
+    def _get_cell_text(self, row: int, col: int) -> str:
+        """Get display text from a table cell, including combo box widgets."""
+        widget = self.table.cellWidget(row, col)
+        if widget and isinstance(widget, QComboBox):
+            return widget.currentText()
+        item = self.table.item(row, col)
+        return item.text() if item else ""
+
+    def _copy_table_selection(self):
+        """Copy selected table cells to clipboard as tab-separated text."""
+        sel_model = self.table.selectionModel()
+        indexes = sel_model.selectedIndexes()
+        if not indexes:
+            return
+
+        # Gather all selected cell coordinates
+        cells = {(idx.row(), idx.column()) for idx in indexes}
+
+        rows = sorted({r for r, c in cells})
+        cols = sorted({c for r, c in cells})
+
+        lines = []
+        for r in rows:
+            row_vals = []
+            for c in cols:
+                if (r, c) in cells:
+                    row_vals.append(self._get_cell_text(r, c))
+                else:
+                    row_vals.append("")
+            lines.append("\t".join(row_vals))
+
+        QGuiApplication.clipboard().setText("\n".join(lines))
+
     def _set_heat_italic(self, italic: bool):
         """Set the heat spinbox font to italic (auto-incremented) or normal (device data)."""
         f = self.heat_spin.font()
@@ -2353,7 +2543,7 @@ class MainWindow(QMainWindow):
             heat_num = min(max(int(self.live_current_heat), 1), 99)
             if self.heat_spin.value() != heat_num:
                 self.heat_spin.setValue(heat_num)
-            self._set_heat_italic(False)  # device confirmed the heat — normal style
+            self._set_heat_italic(False)  # device confirmed the heat â€” normal style
 
         self._update_banner_from_live_state()
 
@@ -2370,7 +2560,7 @@ class MainWindow(QMainWindow):
         event_raw = self.live_current_event or str(self.event_spin.value())
         event_name = self._lookup_event_name(event_raw)
         compact_mode = bool(getattr(self, "_banner_compact_mode", False))
-        name_part = f" — {event_name}" if event_name else ""
+        name_part = f" \u2014 {event_name}" if event_name else ""
 
         # Update timer display banner (digital clock style)
         timer_text = self.live_timer_display if self.live_timer_display else "00:00"
@@ -2386,7 +2576,7 @@ class MainWindow(QMainWindow):
             heat_text = f"<i>{heat_text}</i>"
         self.event_heat_banner.setText(f"Event: {event_text}{name_text}   Heat: {heat_text}")
 
-        # Update date banner — use device date if available, otherwise OS date.
+        # Update date banner â€” use device date if available, otherwise OS date.
         display_date = self.live_current_date or get_local_date_string()
         self.date_banner.setText(f"Date: {display_date}")
 
@@ -2502,7 +2692,9 @@ class MainWindow(QMainWindow):
         heat_num = self.heat_spin.value()
         read_seconds = self.read_seconds_spin.value()
 
-        self.status.showMessage(f"Downloading event {event_num}, heat {heat_num}...")
+        event_label = "all events" if event_num == 0 else f"event {event_num}"
+        heat_label = "all heats" if heat_num == 0 else f"heat {heat_num}"
+        self.status.showMessage(f"Downloading {event_label}, {heat_label}...")
 
         client = None
         try:
@@ -2519,11 +2711,11 @@ class MainWindow(QMainWindow):
 
                 if done:
                     self.status.showMessage(
-                        f"Live retransmit complete: event {event_num}, heat {heat_num}, +{added} valid rows"
+                        f"Live retransmit complete: {event_label}, {heat_label}, +{added} valid rows"
                     )
                 else:
                     self.status.showMessage(
-                        f"Live retransmit timed out: event {event_num}, heat {heat_num}, +{added} valid rows"
+                        f"Live retransmit timed out: {event_label}, {heat_label}, +{added} valid rows"
                     )
             else:
                 client = await self._open_client(port, self.selected_baud(), 0.2)
@@ -2710,7 +2902,7 @@ class MainWindow(QMainWindow):
                 continue
 
             if r["status"] == "ok":
-                lines.append(f"<b>{header}</b>: <span style='color:#27ae60'>All {n_match} result(s) match ✓</span>")
+                lines.append(f"<b>{header}</b>: <span style='color:#27ae60'>All {n_match} result(s) match âœ“</span>")
                 continue
 
             all_ok = False
@@ -2735,7 +2927,7 @@ class MainWindow(QMainWindow):
 
             lines.append("<br>".join(parts))
 
-        title = "Sync Results — All Match ✓" if all_ok else "Sync Results — Differences Found"
+        title = "Sync Results â€” All Match âœ“" if all_ok else "Sync Results â€” Differences Found"
         body = "<br><br>".join(lines)
 
         msg = QMessageBox(self)
@@ -2832,6 +3024,7 @@ class MainWindow(QMainWindow):
             client = await self._open_client(port, self.selected_baud(), 0.1)
             self.live_client = client
             self.log_timer_command(f"Live COM opened: {port} @ {self.selected_baud()}")
+            self._set_activity_indicator_idle()
 
             async def runner():
                 loop_error = None
@@ -2862,6 +3055,7 @@ class MainWindow(QMainWindow):
                         self.download_btn.setEnabled(True)
                         self._led_timer.stop()
                         self._hide_led()
+                        self._set_activity_indicator_idle()
 
             self.live_task = asyncio.create_task(runner())
         except Exception as e:
@@ -2877,6 +3071,7 @@ class MainWindow(QMainWindow):
             self.download_btn.setEnabled(True)
             self._led_timer.stop()
             self._hide_led()
+            self._set_activity_indicator_idle()
             err_str = str(e)
             if "semaphore" in err_str.lower() or "errno 121" in err_str.lower() or "oserror(22" in err_str.lower():
                 QMessageBox.critical(
@@ -2938,11 +3133,8 @@ class MainWindow(QMainWindow):
             self._blink_activity_indicator()
 
         self.last_raw_bytes = bytes(self.live_raw_buffer)
-        cleaned = sanitize_device_bytes(self.last_raw_bytes)
-        rows, _ = parse_time_machine_text(cleaned)
-        self.last_rows = rows
-        self.populate_table(rows)
         self.update_raw_view()
+        self._write_session_results_csv()
         self.status.showMessage("Live capture stopped")
 
     # -----------------------------
@@ -3003,7 +3195,6 @@ class MainWindow(QMainWindow):
                 item.setFont(f)
             self.table.setItem(r, c, item)
 
-        self.table.setSortingEnabled(True)
         self.table.scrollToItem(self.table.item(self.table.rowCount() - 1, 0))
         self._update_event_heat_banner(self.last_rows)
         self._write_session_results_csv()
@@ -3030,13 +3221,13 @@ class MainWindow(QMainWindow):
         if re.match(r"^010{5,6}$", line):
             self._reset_ack_streak += 1
             if self._reset_ack_streak == 2:
-                # Second consecutive reset ack → increment heat and reset timer display
+                # Second consecutive reset ack â†’ increment heat and reset timer display
                 new_heat = min(self.heat_spin.value() + 1, 99)
                 self.heat_spin.setValue(new_heat)
                 self.live_current_heat = f"{new_heat:02d}"
                 self.live_timer_display = "0:00"
                 self.timer_running = False
-                self._set_heat_italic(True)  # predicted increment — italicize until device confirms
+                self._set_heat_italic(True)  # predicted increment â€” italicize until device confirms
                 self._update_timer_button_visual()
                 self._update_banner_from_live_state()
                 self.log_timer_command(f"Consecutive reset ack: heat advanced to {new_heat}")
@@ -3160,8 +3351,20 @@ class MainWindow(QMainWindow):
                 timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
             )
 
-            self.last_rows.append(row)
-            self.append_table_row(row)
+            # Skip duplicate results (e.g. from device sync retransmit)
+            is_dup = any(
+                r.row_type == "result"
+                and r.event == row_event
+                and r.heat == row_heat
+                and r.lane == lane
+                and r.place == place
+                and r.cumulative_time == cumulative
+                and r.split_time == split
+                for r in self.last_rows
+            )
+            if not is_dup:
+                self.last_rows.append(row)
+                self.append_table_row(row)
             return
 
         # Optionally preserve non-result live lines internally
@@ -3287,7 +3490,6 @@ class MainWindow(QMainWindow):
 
         self._table_bold = bold
         self._table_last_group = last_group
-        self.table.setSortingEnabled(True)
         if self.table.rowCount() > 0:
             self.table.scrollToItem(self.table.item(self.table.rowCount() - 1, 0))
         self._update_event_heat_banner(rows)
@@ -3363,7 +3565,7 @@ class MainWindow(QMainWindow):
 
     def _create_bib_combo(self, table_row: int, event_code: str, current_bib: str, bold: bool, lane: str = "") -> QComboBox:
         """Create a QComboBox for the bib column filtered by event metadata and teams."""
-        combo = QComboBox()
+        combo = NoScrollComboBox()
         combo.setEditable(True)
         # Keep the combo's own size hint small so it doesn't widen the column;
         # the dropdown popup can still be wide enough to read full names.
@@ -3417,7 +3619,7 @@ class MainWindow(QMainWindow):
 
     def _create_team_combo(self, table_row: int, current_team: str, bold: bool) -> QComboBox:
         """Create a QComboBox for the Team column with home + opponent teams."""
-        combo = QComboBox()
+        combo = NoScrollComboBox()
         combo.setEditable(True)
 
         teams = []
@@ -3514,19 +3716,18 @@ class MainWindow(QMainWindow):
                     parsed_row.age_group = info.get("age_group", "N/A")
 
                 self.table.blockSignals(True)
-                # Update Team combo (column 5 is a cell widget)
-                team_combo = self.table.cellWidget(table_row, 6)
+                # Update Team combo (column 7)
+                team_combo = self.table.cellWidget(table_row, 7)
                 if isinstance(team_combo, QComboBox):
                     idx = team_combo.findText(parsed_row.team_name)
                     if idx >= 0:
                         team_combo.setCurrentIndex(idx)
                     else:
                         team_combo.setEditText(parsed_row.team_name)
-                self.table.setItem(table_row, 7, QTableWidgetItem(parsed_row.first_name))
-                self.table.setItem(table_row, 8, QTableWidgetItem(parsed_row.last_name))
-                self.table.setItem(table_row, 9, QTableWidgetItem(parsed_row.cumulative_time))
-                self.table.setItem(table_row, 10, QTableWidgetItem(parsed_row.gender))
-                self.table.setItem(table_row, 11, QTableWidgetItem(parsed_row.age_group))
+                self.table.setItem(table_row, 8, QTableWidgetItem(parsed_row.first_name))
+                self.table.setItem(table_row, 9, QTableWidgetItem(parsed_row.last_name))
+                self.table.setItem(table_row, 11, QTableWidgetItem(parsed_row.gender))
+                self.table.setItem(table_row, 12, QTableWidgetItem(parsed_row.age_group))
                 self.table.blockSignals(False)
                 self._write_session_results_csv()
                 self.status.showMessage(f"Assigned bib {bib_value} to row {table_row + 1}")
@@ -3544,10 +3745,10 @@ class MainWindow(QMainWindow):
             event_display = last.event.lstrip("0") or last.event
             heat_display = last.heat.lstrip("0") or last.heat
             event_name = self._lookup_event_name(last.event)
-            name_part = f" — {event_name}" if event_name else ""
+            name_part = f" \u2014 {event_name}" if event_name else ""
             self.event_heat_banner.setText(f"Event: {event_display}{name_part}   Heat: {heat_display}")
         else:
-            self.event_heat_banner.setText("Event: —   Heat: —")
+            self.event_heat_banner.setText("Event: \u2014   Heat: \u2014")
 
     def update_raw_view(self):
         scrollbar = self.raw_text.verticalScrollBar()
@@ -3557,11 +3758,7 @@ class MainWindow(QMainWindow):
             self.raw_text.setPlainText(raw_bytes_to_hex(self.last_raw_bytes))
         else:
             text = sanitize_device_bytes(self.last_raw_bytes)
-            # Strip 6-digit timer count lines from display to reduce clutter
-            filtered = "\n".join(
-                ln for ln in text.splitlines()
-                if not TIMER_COUNT_RE.match(ln.strip())
-            )
+            filtered = self._filter_timer_count_lines(text)
             self.raw_text.setPlainText(filtered)
 
         if self.live_task and not self.live_task.done():
@@ -3619,35 +3816,47 @@ class MainWindow(QMainWindow):
 
         hidden_types = {"live_time", "heat_header", "event_header", "raw"}
 
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Type", "Event", "Event Type", "Heat", "Date", "Time", "Lane", "Team", "Bib", "First Name", "Last Name", "Gender", "Age Group", "Place", "Finish\nTime", "Split Time", "Raw Line"])
-                for row in self.last_rows:
-                    if row.row_type in hidden_types:
-                        continue
-                    writer.writerow([
-                        row.row_type,
-                        row.event,
-                        row.event_type,
-                        row.heat,
-                        get_local_date_string(),
-                        row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp,
-                        row.lane,
-                        row.team_name,
-                        row.bib,
-                        row.first_name,
-                        row.last_name,
-                        row.gender,
-                        row.age_group,
-                        row.place,
-                        f'="{row.cumulative_time}"' if row.cumulative_time else "",
-                        f'="{row.split_time}"' if row.split_time else "",
-                        row.raw_line,
-                    ])
-            self.status.showMessage(f"Saved CSV: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", str(e))
+        while True:
+            try:
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Type", "Event", "Event Type", "Heat", "Date", "Time", "Lane", "Bib", "Team", "First Name", "Last Name", "Gender", "Age Group", "Place", "Finish\nTime", "Split Time", "Raw Line"])
+                    for row in self.last_rows:
+                        if row.row_type in hidden_types:
+                            continue
+                        writer.writerow([
+                            row.row_type,
+                            row.event,
+                            row.event_type,
+                            row.heat,
+                            get_local_date_string(),
+                            self._csv_text_value((row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp).strip()),
+                            row.lane,
+                            row.bib,
+                            row.team_name,
+                            row.first_name,
+                            row.last_name,
+                            row.gender,
+                            row.age_group,
+                            row.place,
+                            self._csv_text_value(self._strip_time_zeros(row.cumulative_time) if row.cumulative_time else ""),
+                            self._csv_text_value(self._strip_time_zeros(row.split_time) if row.split_time else ""),
+                            row.raw_line,
+                        ])
+                self.status.showMessage(f"Saved CSV: {path}")
+                break
+            except PermissionError:
+                reply = QMessageBox.warning(
+                    self, "File In Use",
+                    f"Cannot save to:\n{path}\n\n"
+                    "Please close the file in Excel and click Retry.",
+                    QMessageBox.Retry | QMessageBox.Cancel,
+                )
+                if reply != QMessageBox.Retry:
+                    break
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", str(e))
+                break
 
     def load_bib_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -3689,7 +3898,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Load Error", str(e))
 
     def _auto_load_bib_csv(self):
-        default_path = os.path.join("info", "bib_import.csv")
+        default_path = os.path.join(_app_dir(), "info", "bib_import.csv")
         if not os.path.isfile(default_path):
             return
         try:
@@ -3762,7 +3971,7 @@ class MainWindow(QMainWindow):
         self.opponent_teams = self.opponent_combo.checkedItems()
 
     def _auto_load_events_csv(self):
-        default_path = os.path.join("info", "event_import.csv")
+        default_path = os.path.join(_app_dir(), "info", "event_import.csv")
         if not os.path.isfile(default_path):
             return
         try:
@@ -3896,7 +4105,7 @@ class MainWindow(QMainWindow):
 
     def on_table_cell_changed(self, row, column):
         """Handle table cell edits, specifically for bib column auto-population."""
-        if column != 5:  # Bib column index
+        if column != 6:  # Bib column index
             return
 
         item = self.table.item(row, column)
@@ -3945,12 +4154,18 @@ class MainWindow(QMainWindow):
                     parsed_row.age_group = info.get("age_group", "N/A")
 
                 self.table.blockSignals(True)
-                self.table.setItem(row, 5, QTableWidgetItem(parsed_row.team_name))      # Team
-                self.table.setItem(row, 6, QTableWidgetItem(parsed_row.bib))            # Bib
-                self.table.setItem(row, 7, QTableWidgetItem(parsed_row.first_name))     # First Name
-                self.table.setItem(row, 8, QTableWidgetItem(parsed_row.last_name))      # Last Name
-                self.table.setItem(row, 9, QTableWidgetItem(parsed_row.gender))         # Gender
-                self.table.setItem(row, 10, QTableWidgetItem(parsed_row.age_group))     # Age Group
+                # Update Team combo (column 7)
+                team_combo = self.table.cellWidget(row, 7)
+                if isinstance(team_combo, QComboBox):
+                    idx = team_combo.findText(parsed_row.team_name)
+                    if idx >= 0:
+                        team_combo.setCurrentIndex(idx)
+                    else:
+                        team_combo.setEditText(parsed_row.team_name)
+                self.table.setItem(row, 8, QTableWidgetItem(parsed_row.first_name))     # First Name
+                self.table.setItem(row, 9, QTableWidgetItem(parsed_row.last_name))      # Last Name
+                self.table.setItem(row, 11, QTableWidgetItem(parsed_row.gender))        # Gender
+                self.table.setItem(row, 12, QTableWidgetItem(parsed_row.age_group))     # Age Group
                 self.table.blockSignals(False)
                 self._write_session_results_csv()
                 return
@@ -4002,33 +4217,77 @@ class MainWindow(QMainWindow):
         loop.create_task(self.close_async())
         event.accept()
 
+    @staticmethod
+    def _strip_time_zeros(t: str) -> str:
+        """Normalize device race times for CSV display."""
+        if not t:
+            return t
+        t = t.strip()
+
+        m = re.match(r"^(\d{2}):(\d{2}):(\d{2}\.\d{2})$", t)
+        if m:
+            hours = int(m.group(1))
+            minutes = int(m.group(2))
+            seconds = m.group(3)
+            if hours == 0:
+                return f"{minutes}:{seconds}"
+            return f"{hours}:{minutes:02d}:{seconds}"
+
+        m = re.match(r"^(\d{2}):(\d{2}\.\d{2})$", t)
+        if m:
+            minutes = int(m.group(1))
+            seconds = m.group(2)
+            return f"{minutes}:{seconds}"
+
+        return t
+
+    @staticmethod
+    def _csv_text_value(value: str) -> str:
+        if not value:
+            return ""
+        return f'="{value.replace(chr(34), chr(34) * 2)}"'
+
     def _write_session_results_csv(self):
         hidden_types = {"live_time", "heat_header", "event_header", "raw"}
         rows = [r for r in self.last_rows if r.row_type not in hidden_types]
-        try:
-            with open(self.session_results_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "Date", "Time", "Event", "Event Type", "Heat", "Lane",
-                    "Team", "Bib", "First Name", "Last Name",
-                    "Gender", "Age Group", "Place", "Finish\nTime", "Split Time",
-                ])
-                for row in rows:
-                    event_name = self._lookup_event_name(row.event)
-                    meta = self._lookup_event_meta(row.event)
-                    gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
-                    age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
-                    time_val = row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp
+        while True:
+            try:
+                with open(self.session_results_csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
                     writer.writerow([
-                        row.date, time_val, row.event, event_name or row.event_type,
-                        row.heat, row.lane, row.team_name, row.bib,
-                        row.first_name, row.last_name, gender, age_group,
-                        row.place,
-                        f'="{row.cumulative_time}"' if row.cumulative_time else "",
-                        f'="{row.split_time}"' if row.split_time else "",
+                        "Date", "Time", "Event", "Event Type", "Heat", "Lane",
+                        "Bib", "Team", "First Name", "Last Name",
+                        "Gender", "Age Group", "Place", "Finish\nTime", "Split Time",
                     ])
-        except Exception:
-            pass
+                    for row in rows:
+                        event_name = self._lookup_event_name(row.event)
+                        meta = self._lookup_event_meta(row.event)
+                        gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
+                        age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
+                        date_val = row.date or get_local_date_string()
+                        time_val = (row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp).strip()
+                        cum_val = self._strip_time_zeros(row.cumulative_time) if row.cumulative_time else ""
+                        spl_val = self._strip_time_zeros(row.split_time) if row.split_time else ""
+                        writer.writerow([
+                            date_val, self._csv_text_value(time_val), row.event, event_name or row.event_type,
+                            row.heat, row.lane, row.bib, row.team_name,
+                            row.first_name, row.last_name, gender, age_group,
+                            row.place,
+                            self._csv_text_value(cum_val),
+                            self._csv_text_value(spl_val),
+                        ])
+                break
+            except PermissionError:
+                reply = QMessageBox.warning(
+                    self, "File In Use",
+                    f"Cannot save to:\n{self.session_results_csv_path}\n\n"
+                    "Please close the file in Excel and click Retry.",
+                    QMessageBox.Retry | QMessageBox.Cancel,
+                )
+                if reply != QMessageBox.Retry:
+                    break
+            except Exception:
+                break
 
     def _auto_save_csv(self):
         hidden_types = {"live_time", "heat_header", "event_header", "raw"}
@@ -4036,35 +4295,49 @@ class MainWindow(QMainWindow):
         if not rows:
             return
 
-        try:
-            os.makedirs(self.log_session_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = self.build_csv_default_name().replace(".csv", "")
-            path = os.path.join(self.log_session_dir, f"{base}_{ts}.csv")
+        os.makedirs(self.log_session_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = self.build_csv_default_name().replace(".csv", "")
+        path = os.path.join(self.log_session_dir, f"{base}_{ts}.csv")
 
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "Date", "Time", "Event", "Event Type", "Heat", "Lane",
-                    "Team", "Bib", "First Name", "Last Name",
-                    "Gender", "Age Group", "Place", "Cumulative", "Split Time",
-                ])
-                for row in rows:
-                    meta = self._lookup_event_meta(row.event)
-                    event_name = self._lookup_event_name(row.event)
-                    gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
-                    age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
-                    time_val = row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp
+        while True:
+            try:
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
                     writer.writerow([
-                        row.date, time_val, row.event, event_name or row.event_type,
-                        row.heat, row.lane, row.team_name, row.bib,
-                        row.first_name, row.last_name, gender, age_group,
-                        row.place,
-                        f'="{row.cumulative_time}"' if row.cumulative_time else "",
-                        f'="{row.split_time}"' if row.split_time else "",
+                        "Date", "Time", "Event", "Event Type", "Heat", "Lane",
+                        "Bib", "Team", "First Name", "Last Name",
+                        "Gender", "Age Group", "Place", "Cumulative", "Split Time",
                     ])
-        except Exception:
-            pass  # Never block close due to save failure
+                    for row in rows:
+                        meta = self._lookup_event_meta(row.event)
+                        event_name = self._lookup_event_name(row.event)
+                        gender = row.gender if row.gender and row.gender != "N/A" else meta.get("gender", "")
+                        age_group = row.age_group if row.age_group and row.age_group != "N/A" else meta.get("age_group", "")
+                        date_val = row.date or get_local_date_string()
+                        time_val = (row.timestamp.split(' ')[1] if ' ' in row.timestamp else row.timestamp).strip()
+                        cum_val = self._strip_time_zeros(row.cumulative_time) if row.cumulative_time else ""
+                        spl_val = self._strip_time_zeros(row.split_time) if row.split_time else ""
+                        writer.writerow([
+                            date_val, self._csv_text_value(time_val), row.event, event_name or row.event_type,
+                            row.heat, row.lane, row.bib, row.team_name,
+                            row.first_name, row.last_name, gender, age_group,
+                            row.place,
+                            self._csv_text_value(cum_val),
+                            self._csv_text_value(spl_val),
+                        ])
+                break
+            except PermissionError:
+                reply = QMessageBox.warning(
+                    self, "File In Use",
+                    f"Cannot save to:\n{path}\n\n"
+                    "Please close the file in Excel and click Retry.",
+                    QMessageBox.Retry | QMessageBox.Cancel,
+                )
+                if reply != QMessageBox.Retry:
+                    break
+            except Exception:
+                break  # Never block close due to save failure
 
 
 def main():
@@ -4081,3 +4354,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
