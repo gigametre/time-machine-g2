@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finish Line Order Detector</title>
+  <style>
+    :root {
+      --bg: #111827;
+      --panel: #1f2937;
+      --text: #f9fafb;
+      --muted: #d1d5db;
+      --accent: #f97316;
+      --good: #22c55e;
+      --warn: #facc15;
+      --bad: #ef4444;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+
+    header {
+      padding: 14px 16px 8px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      letter-spacing: 0.02em;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .app {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding-bottom: 40px;
+    }
+
+    .controls, .settings, .results, .notes {
+      margin: 10px 12px;
+      padding: 12px;
+      border-radius: 14px;
+      background: var(--panel);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.24);
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 8px;
+    }
+
+    button, input[type="range"] {
+      width: 100%;
+    }
+
+    button {
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 10px;
+      background: #374151;
+      color: var(--text);
+      font-weight: 700;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+
+    button.primary { background: var(--accent); color: #111827; }
+    button.good { background: var(--good); color: #052e16; }
+    button.bad { background: var(--bad); color: white; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .stage-wrap {
+      margin: 10px 12px;
+      border-radius: 16px;
+      overflow: hidden;
+      background: #000;
+      position: relative;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+
+    #view {
+      display: block;
+      width: 100%;
+      height: auto;
+      touch-action: none;
+      background: #000;
+    }
+
+    #video {
+      display: none;
+    }
+
+    .settings {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 14px;
+      align-items: center;
+    }
+
+    label {
+      display: block;
+      font-size: 0.95rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .readout {
+      font-size: 0.9rem;
+      color: var(--text);
+      margin-top: 4px;
+    }
+
+    .status {
+      margin: 10px 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #030712;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .result-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+    }
+
+    .card {
+      background: #111827;
+      border: 1px solid #374151;
+      border-radius: 14px;
+      overflow: hidden;
+    }
+
+    .card img {
+      width: 100%;
+      display: block;
+      background: #000;
+    }
+
+    .card .body {
+      padding: 10px;
+    }
+
+    .place {
+      font-size: 1.4rem;
+      font-weight: 800;
+      color: var(--warn);
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    ol {
+      margin-top: 8px;
+      padding-left: 22px;
+    }
+
+    .warning {
+      color: var(--warn);
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Finish Line Order Detector</h1>
+      <div class="small">Prototype: detects motion crossing a vertical finish line and records crossing order.</div>
+    </header>
+
+    <div class="controls">
+      <button id="startBtn" class="primary">Start camera</button>
+      <button id="armBtn" class="good" disabled>Arm detection</button>
+      <button id="resetBtn">Reset results</button>
+      <button id="csvBtn">Export CSV</button>
+    </div>
+
+    <div class="stage-wrap">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="view"></canvas>
+    </div>
+
+    <div class="settings">
+      <div>
+        <label for="motionPct">Motion required at line</label>
+        <input id="motionPct" type="range" min="0.2" max="12" step="0.1" value="2.2" />
+        <div class="readout"><span id="motionPctVal">2.2</span>% of finish-line pixels must change</div>
+      </div>
+      <div>
+        <label for="diffThreshold">Pixel change threshold</label>
+        <input id="diffThreshold" type="range" min="10" max="90" step="1" value="38" />
+        <div class="readout">Change above <span id="diffThresholdVal">38</span> counts as motion</div>
+      </div>
+      <div>
+        <label for="roiWidth">Finish-line detection width</label>
+        <input id="roiWidth" type="range" min="4" max="40" step="1" value="14" />
+        <div class="readout"><span id="roiWidthVal">14</span> pixels around the line</div>
+      </div>
+      <div>
+        <label for="clearFrames">Frames clear before next runner</label>
+        <input id="clearFrames" type="range" min="1" max="12" step="1" value="4" />
+        <div class="readout"><span id="clearFramesVal">4</span> clear frames required</div>
+      </div>
+    </div>
+
+    <div class="status" id="status">Camera not started.</div>
+
+    <section class="results">
+      <h2 style="margin-top:0;">Crossing order</h2>
+      <div id="resultList" class="result-list"></div>
+    </section>
+
+    <section class="notes">
+      <strong>Setup tips</strong>
+      <ol>
+        <li>Place the phone on a tripod, directly beside the finish line, looking across the line.</li>
+        <li>Drag the orange vertical line so it sits exactly on the real finish line.</li>
+        <li>Use good lighting and keep spectators out of the finish-line strip.</li>
+        <li>Press <strong>Arm detection</strong> just before the runners arrive.</li>
+        <li class="warning">This prototype is for crossing order / review, not official fully automatic timing.</li>
+      </ol>
+    </section>
+  </div>
+
+<script>
+(() => {
+  const video = document.getElementById("video");
+  const view = document.getElementById("view");
+  const ctx = view.getContext("2d");
+  const proc = document.createElement("canvas");
+  const pctx = proc.getContext("2d", { willReadFrequently: true });
+
+  const startBtn = document.getElementById("startBtn");
+  const armBtn = document.getElementById("armBtn");
+  const resetBtn = document.getElementById("resetBtn");
+  const csvBtn = document.getElementById("csvBtn");
+  const statusEl = document.getElementById("status");
+  const resultList = document.getElementById("resultList");
+
+  const motionPct = document.getElementById("motionPct");
+  const diffThreshold = document.getElementById("diffThreshold");
+  const roiWidth = document.getElementById("roiWidth");
+  const clearFrames = document.getElementById("clearFrames");
+
+  const motionPctVal = document.getElementById("motionPctVal");
+  const diffThresholdVal = document.getElementById("diffThresholdVal");
+  const roiWidthVal = document.getElementById("roiWidthVal");
+  const clearFramesVal = document.getElementById("clearFramesVal");
+
+  let stream = null;
+  let lineX = 0;
+  let prevStrip = null;
+  let prevStripKey = "";
+  let armed = false;
+  let occupied = false;
+  let clearCount = 0;
+  let armStartPerf = 0;
+  let frameLoopStarted = false;
+  let lastActivityPct = 0;
+  let lastAvgDiff = 0;
+  let results = [];
+
+  function updateSliderText() {
+    motionPctVal.textContent = Number(motionPct.value).toFixed(1);
+    diffThresholdVal.textContent = diffThreshold.value;
+    roiWidthVal.textContent = roiWidth.value;
+    clearFramesVal.textContent = clearFrames.value;
+  }
+
+  [motionPct, diffThreshold, roiWidth, clearFrames].forEach(el =>
+    el.addEventListener("input", updateSliderText)
+  );
+  updateSliderText();
+
+  function initCanvasSize() {
+    const w = video.videoWidth || 1280;
+    const h = video.videoHeight || 720;
+
+    if (view.width !== w || view.height !== h) {
+      view.width = w;
+      view.height = h;
+      proc.width = w;
+      proc.height = h;
+      lineX = lineX || Math.round(w * 0.5);
+      prevStrip = null;
+      prevStripKey = "";
+    }
+  }
+
+  async function startCamera() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 60, min: 24 }
+        }
+      });
+
+      video.srcObject = stream;
+      await video.play();
+      initCanvasSize();
+
+      armBtn.disabled = false;
+      startBtn.textContent = "Camera running";
+      startBtn.disabled = true;
+
+      if (!frameLoopStarted) {
+        frameLoopStarted = true;
+        scheduleNextFrame();
+      }
+    } catch (err) {
+      statusEl.textContent = "Camera error: " + err.message;
+      console.error(err);
+    }
+  }
+
+  function scheduleNextFrame() {
+    if ("requestVideoFrameCallback" in video) {
+      video.requestVideoFrameCallback(processFrame);
+    } else {
+      requestAnimationFrame((now) => processFrame(now, null));
+    }
+  }
+
+  function processFrame(now, metadata) {
+    if (video.readyState >= 2) {
+      initCanvasSize();
+
+      const w = view.width;
+      const h = view.height;
+
+      pctx.drawImage(video, 0, 0, w, h);
+      ctx.drawImage(video, 0, 0, w, h);
+
+      analyzeFinishLine(w, h);
+      drawOverlay(w, h);
+      updateStatus(metadata);
+    }
+
+    scheduleNextFrame();
+  }
+
+  function analyzeFinishLine(w, h) {
+    const half = Math.max(2, Math.floor(Number(roiWidth.value) / 2));
+    const x0 = Math.max(0, Math.min(w - 1, Math.round(lineX - half)));
+    const stripW = Math.max(1, Math.min(w - x0, half * 2 + 1));
+    const stripKey = `${x0}:${stripW}:${h}`;
+    const img = pctx.getImageData(x0, 0, stripW, h).data;
+
+    const lumas = new Uint8Array(stripW * h);
+    let active = 0;
+    let totalDiff = 0;
+
+    const hasPrev = prevStrip && prevStripKey === stripKey;
+    const threshold = Number(diffThreshold.value);
+
+    for (let i = 0, j = 0; i < img.length; i += 4, j++) {
+      const y = (img[i] * 77 + img[i + 1] * 150 + img[i + 2] * 29) >> 8;
+      lumas[j] = y;
+
+      if (hasPrev) {
+        const d = Math.abs(y - prevStrip[j]);
+        totalDiff += d;
+        if (d >= threshold) active++;
+      }
+    }
+
+    if (hasPrev) {
+      lastActivityPct = (active / lumas.length) * 100;
+      lastAvgDiff = totalDiff / lumas.length;
+
+      const triggerPct = Number(motionPct.value);
+      const resetPct = triggerPct * 0.45;
+
+      if (armed) {
+        if (!occupied && lastActivityPct >= triggerPct) {
+          recordCrossing();
+          occupied = true;
+          clearCount = 0;
+        } else if (occupied) {
+          if (lastActivityPct < resetPct) {
+            clearCount++;
+            if (clearCount >= Number(clearFrames.value)) {
+              occupied = false;
+              clearCount = 0;
+            }
+          } else {
+            clearCount = 0;
+          }
+        }
+      }
+    }
+
+    prevStrip = lumas;
+    prevStripKey = stripKey;
+  }
+
+  function drawOverlay(w, h) {
+    const half = Math.max(2, Math.floor(Number(roiWidth.value) / 2));
+
+    ctx.save();
+
+    ctx.fillStyle = "rgba(249, 115, 22, 0.13)";
+    ctx.fillRect(Math.round(lineX - half), 0, half * 2 + 1, h);
+
+    ctx.strokeStyle = "#f97316";
+    ctx.lineWidth = Math.max(3, Math.round(w / 250));
+    ctx.beginPath();
+    ctx.moveTo(lineX, 0);
+    ctx.lineTo(lineX, h);
+    ctx.stroke();
+
+    ctx.fillStyle = armed ? "rgba(34,197,94,0.90)" : "rgba(17,24,39,0.85)";
+    ctx.fillRect(12, 12, 255, 78);
+
+    ctx.fillStyle = armed ? "#052e16" : "#f9fafb";
+    ctx.font = `${Math.max(18, Math.round(w / 45))}px system-ui, sans-serif`;
+    ctx.fillText(armed ? "ARMED" : "NOT ARMED", 24, 42);
+
+    ctx.font = `${Math.max(13, Math.round(w / 75))}px ui-monospace, monospace`;
+    ctx.fillText(`motion: ${lastActivityPct.toFixed(2)}%`, 24, 68);
+
+    ctx.restore();
+  }
+
+  function updateStatus(metadata) {
+    const fpsInfo = metadata && metadata.presentedFrames
+      ? `frames=${metadata.presentedFrames}`
+      : "frames=unknown";
+    const mode = armed ? "ARMED" : "SAFE";
+    statusEl.textContent =
+      `${mode} | results=${results.length} | occupied=${occupied} | ` +
+      `motion=${lastActivityPct.toFixed(2)}% | avgDiff=${lastAvgDiff.toFixed(1)} | ${fpsInfo}`;
+  }
+
+  function recordCrossing() {
+    const elapsedMs = Math.round(performance.now() - armStartPerf);
+    const iso = new Date().toISOString();
+    const clock = new Date().toLocaleTimeString();
+
+    let thumb = "";
+    try {
+      thumb = view.toDataURL("image/jpeg", 0.78);
+    } catch (e) {
+      console.warn("Could not capture thumbnail", e);
+    }
+
+    results.push({
+      place: results.length + 1,
+      elapsedMs,
+      clock,
+      iso,
+      motionPct: lastActivityPct,
+      avgDiff: lastAvgDiff,
+      thumb
+    });
+
+    beep();
+    renderResults();
+  }
+
+  function renderResults() {
+    resultList.innerHTML = "";
+
+    for (const r of results) {
+      const card = document.createElement("div");
+      card.className = "card";
+
+      const img = document.createElement("img");
+      img.alt = `Runner place ${r.place}`;
+      img.src = r.thumb;
+
+      const body = document.createElement("div");
+      body.className = "body";
+
+      body.innerHTML = `
+        <div class="place">#${r.place}</div>
+        <div class="mono">${r.elapsedMs} ms after arm</div>
+        <div class="mono">${r.clock}</div>
+        <div class="mono">motion ${r.motionPct.toFixed(2)}%</div>
+      `;
+
+      card.appendChild(img);
+      card.appendChild(body);
+      resultList.appendChild(card);
+    }
+  }
+
+  function beep() {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ac = new AudioCtx();
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+
+      o.frequency.value = 880;
+      g.gain.value = 0.035;
+      o.connect(g);
+      g.connect(ac.destination);
+      o.start();
+      setTimeout(() => {
+        o.stop();
+        ac.close();
+      }, 80);
+    } catch (e) {
+      // Ignore audio restrictions.
+    }
+  }
+
+  function toggleArm() {
+    armed = !armed;
+    occupied = false;
+    clearCount = 0;
+    prevStrip = null;
+    prevStripKey = "";
+
+    if (armed) {
+      armStartPerf = performance.now();
+      armBtn.textContent = "Disarm detection";
+      armBtn.className = "bad";
+    } else {
+      armBtn.textContent = "Arm detection";
+      armBtn.className = "good";
+    }
+  }
+
+  function resetResults() {
+    results = [];
+    occupied = false;
+    clearCount = 0;
+    renderResults();
+  }
+
+  function exportCsv() {
+    const rows = [
+      ["Place", "Elapsed_ms_after_arm", "Clock", "ISO_time", "Motion_percent", "Average_pixel_diff"]
+    ];
+
+    for (const r of results) {
+      rows.push([
+        r.place,
+        r.elapsedMs,
+        r.clock,
+        r.iso,
+        r.motionPct.toFixed(3),
+        r.avgDiff.toFixed(3)
+      ]);
+    }
+
+    const csv = rows.map(row =>
+      row.map(cell => `"${String(cell).replaceAll('"', '""')}"`).join(",")
+    ).join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().replaceAll(":", "-").slice(0, 19);
+    a.href = url;
+    a.download = `finish_order_${stamp}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function setLineFromPointer(e) {
+    const rect = view.getBoundingClientRect();
+    if (!rect.width) return;
+
+    const xCss = e.clientX - rect.left;
+    lineX = Math.max(0, Math.min(view.width - 1, xCss * view.width / rect.width));
+
+    prevStrip = null;
+    prevStripKey = "";
+  }
+
+  view.addEventListener("pointerdown", (e) => {
+    view.setPointerCapture(e.pointerId);
+    setLineFromPointer(e);
+  });
+
+  view.addEventListener("pointermove", (e) => {
+    if (e.buttons || e.pointerType === "touch") setLineFromPointer(e);
+  });
+
+  startBtn.addEventListener("click", startCamera);
+  armBtn.addEventListener("click", toggleArm);
+  resetBtn.addEventListener("click", resetResults);
+  csvBtn.addEventListener("click", exportCsv);
+
+  // Initial placeholder canvas.
+  view.width = 1280;
+  view.height = 720;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, view.width, view.height);
+  ctx.fillStyle = "#f9fafb";
+  ctx.font = "42px system-ui, sans-serif";
+  ctx.fillText("Press Start camera", 60, 100);
+  lineX = view.width * 0.5;
+  drawOverlay(view.width, view.height);
+})();
+</script>
+</body>
+</html>
